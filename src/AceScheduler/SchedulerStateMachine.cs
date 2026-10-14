@@ -7,6 +7,8 @@ public enum SchedulerState
     Probe,
 }
 
+public sealed record SampleResult(SchedulerState State, double RateMBps);
+
 public sealed class SchedulerOptions
 {
     /// <summary>Read-rate threshold (MB/s) that counts as a scan burst.</summary>
@@ -27,6 +29,8 @@ public sealed record SchedulerEvent(DateTimeOffset Timestamp, string Kind, doubl
 /// rate still high = re-throttle / rate low = scan truly ended -> IDLE.
 /// The probe prevents the starvation feedback loop: throttling collapses the
 /// scanner's IO rate, which by rate alone would fake a "scan ended" signal.
+/// Timing uses wall-clock deltas between samples, never tick counts - the CIM
+/// sampler runs ~1.3s/tick under load (see docs/design.md).
 /// </summary>
 public sealed class SchedulerStateMachine
 {
@@ -39,6 +43,7 @@ public sealed class SchedulerStateMachine
     private double _throttledSeconds;
     private DateTimeOffset _lastTs;
     private double _lastBytes;
+    private double _lastRate;
 
     public SchedulerState State => _state;
 
@@ -50,21 +55,22 @@ public sealed class SchedulerStateMachine
     }
 
     /// <summary>Feed one cumulative-read-bytes observation from the sampler.</summary>
-    public SchedulerState OnSample(double cumulativeReadBytes, DateTimeOffset now)
+    public SampleResult OnSample(double cumulativeReadBytes, DateTimeOffset now)
     {
         if (_lastTs == default)
         {
             _lastTs = now;
             _lastBytes = cumulativeReadBytes;
-            return _state;
+            return new SampleResult(_state, 0);
         }
 
         var dt = (now - _lastTs).TotalSeconds;
         var dBytes = cumulativeReadBytes - _lastBytes;
         _lastTs = now;
         _lastBytes = cumulativeReadBytes;
-        if (dt < 0.2) return _state; // caller clock not ready yet
+        if (dt < 0.2) return new SampleResult(_state, _lastRate); // clock not ready yet
         var mbps = dBytes / 1_048_576 / dt;
+        _lastRate = mbps;
 
         switch (_state)
         {
@@ -107,6 +113,6 @@ public sealed class SchedulerStateMachine
                 break;
         }
 
-        return _state;
+        return new SampleResult(_state, mbps);
     }
 }

@@ -1,6 +1,11 @@
 using System.Diagnostics;
 using AceScheduler;
 
+if (args.Length > 0 && args[0] == "--selftest")
+{
+    return SelfTest.Run(args);
+}
+
 // AceScheduler v0.1 production skeleton: tray + polling engine.
 // Roadmap to the zero-residency design (SCM 7045 trigger, foreground
 // conflict detection) lives in docs/design.md.
@@ -22,6 +27,7 @@ void RetargetIfNeeded()
     var found = TargetDiscovery.FindScanner();
     if (found is null) return;
     target = found;
+    IoSampler.GetCumulativeReadBytes(target.Id); // prime WMI before the engine needs it
     engine = new SchedulerStateMachine(
         options,
         throttle => ProcessThrottle.Apply(target, throttle, fullMask),
@@ -55,3 +61,4 @@ var notifyIcon = new NotifyIcon
 
 Application.ApplicationExit += (_, _) => notifyIcon.Dispose();
 Application.Run();
+return 0;

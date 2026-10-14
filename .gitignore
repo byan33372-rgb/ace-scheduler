@@ -10,3 +10,5 @@ dist/
 dummy.bin
 trial/phases.json
 trial/trial-report.json
+phases.json
+trial-report-cs.json
