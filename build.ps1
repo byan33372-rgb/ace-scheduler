@@ -10,6 +10,7 @@ $dotnet = if (Test-Path (Join-Path $sdkDir 'dotnet.exe')) { Join-Path $sdkDir 'd
 & $dotnet publish (Join-Path $repoRoot 'src\AceScheduler') `
   -c Release -r win-x64 --self-contained `
   -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
+  -p:EnableCompressionInSingleFile=true `
   -o (Join-Path $repoRoot 'dist')
 if ($LASTEXITCODE -ne 0) { throw "publish failed: $LASTEXITCODE" }
 Write-Host "artifact: $(Join-Path $repoRoot 'dist\AceScheduler.exe')"

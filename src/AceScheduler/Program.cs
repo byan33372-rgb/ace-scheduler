@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using AceScheduler;
 
 // AceScheduler v0.1 production skeleton: tray + polling engine.
