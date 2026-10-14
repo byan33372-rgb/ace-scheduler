@@ -1,0 +1,12 @@
+bin/
+obj/
+publish/
+dist/
+*.user
+.vs/
+*.log
+*.jsonl
+*.ctl
+dummy.bin
+trial/phases.json
+trial/trial-report.json
