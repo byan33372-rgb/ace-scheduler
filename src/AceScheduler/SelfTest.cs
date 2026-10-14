@@ -76,7 +76,13 @@ public static class SelfTest
         while (true)
         {
             Thread.Sleep(pollMs);
-            try { if (File.ReadAllText(controlFile).Trim() == "stop") break; } catch { }
+            try
+            {
+                using var fs = File.Open(controlFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var sr = new StreamReader(fs);
+                if (sr.ReadToEnd().Trim() == "stop") break;
+            }
+            catch { }
             try
             {
                 target.Refresh();

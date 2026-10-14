@@ -9,7 +9,11 @@ $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $ticks = 0; $winStart = $sw.Elapsed.TotalSeconds
 while ($true) {
   $cmd = ''
-  try { $cmd = [System.IO.File]::ReadAllText($ControlFile) } catch {}
+  try {
+    $fs2 = [System.IO.File]::Open($ControlFile, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    $cmd = (New-Object System.IO.StreamReader($fs2)).ReadToEnd()
+    $fs2.Dispose()
+  } catch {}
   if ($cmd.Trim() -eq 'stop') { break }
   $x = 1.000001
   for ($i = 1; $i -le 300000; $i++) { $x = [math]::Sqrt($x + 0.000001) }

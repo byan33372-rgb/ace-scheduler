@@ -5,6 +5,12 @@
 # Release gate: 5/5 PASS on this script.
 param()
 $ErrorActionPreference = 'Stop'
+function Set-Control([string]$path, [string]$value) {
+  for ($attempt = 0; $attempt -lt 10; $attempt++) {
+    try { $value | Set-Content $path -ErrorAction Stop; return } catch { Start-Sleep -Milliseconds 100 }
+  }
+  throw "cannot write control file: $path"
+}
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $dir
 $appExe  = Join-Path $dir 'dist\AceScheduler.exe'
@@ -31,9 +37,9 @@ foreach ($z in $zombies) { try { Stop-Process -Id $z.ProcessId -Force -ErrorActi
 foreach ($z in $zombiesExe) { try { Stop-Process -Id $z.Id -Force -ErrorAction Stop } catch {} }
 if ($zombies.Count + $zombiesExe.Count -gt 0) { Write-Host "zombie helpers killed: $($zombies.Count + $zombiesExe.Count)" }
 
-'pause' | Set-Content $dummyCtl
-'run'   | Set-Content $simCtl
-'go'    | Set-Content $limCtl
+Set-Control $dummyCtl 'pause'
+Set-Control $simCtl 'run'
+Set-Control $limCtl 'go'
 
 $size = 256MB
 if (-not (Test-Path $bin) -or (Get-Item $bin).Length -ne $size) {
@@ -56,7 +62,7 @@ function Get-ReadBytes([int]$procId) {
 $dummy = Start-ChildProc 'trial\DummyScanner.ps1' @('-TargetFile', "`"$bin`"", '-LogFile', "`"$dummyLog`"", '-ControlFile', "`"$dummyCtl`"")
 Start-Sleep 1
 $t1s = UtcStamp; $b0 = Get-ReadBytes $dummy.Id
-'run' | Set-Content $dummyCtl
+Set-Control $dummyCtl 'run'
 Start-Sleep 8                        # P1 baseline
 $t1e = UtcStamp; $b1 = Get-ReadBytes $dummy.Id
 $sim = Start-ChildProc 'trial\ForegroundSim.ps1' @('-LogFile', "`"$simLog`"", '-ControlFile', "`"$simCtl`"")
@@ -68,7 +74,7 @@ $lim = Start-Process -FilePath $appExe -ArgumentList @(
 $t2s = UtcStamp; $b2 = $b1
 Start-Sleep 14                       # P2 burst + contention
 $t2e = UtcStamp; $b3 = Get-ReadBytes $dummy.Id
-'pause' | Set-Content $dummyCtl
+Set-Control $dummyCtl 'pause'
 $t3s = UtcStamp
 Start-Sleep 8                        # P3 scan stopped; probe should release
 $chk = Get-Process -Id $dummy.Id -ErrorAction SilentlyContinue
@@ -76,11 +82,11 @@ $rcPriority = ''; $rcAffinity = ''
 if ($chk) { $rcPriority = [string]$chk.PriorityClass; $rcAffinity = $chk.ProcessorAffinity.ToString() }
 Start-Sleep 2
 $t3e = UtcStamp; $b4 = Get-ReadBytes $dummy.Id
-'run' | Set-Content $dummyCtl
+Set-Control $dummyCtl 'run'
 $t4s = UtcStamp; $b5 = $b4
 Start-Sleep 10                       # P4 burst again
 $t4e = UtcStamp; $b6 = Get-ReadBytes $dummy.Id
-'stop' | Set-Content $dummyCtl; 'stop' | Set-Content $simCtl; 'stop' | Set-Content $limCtl
+Set-Control $dummyCtl 'stop'; Set-Control $simCtl 'stop'; Set-Control $limCtl 'stop'
 Start-Sleep 2
 foreach ($p in @($dummy, $sim, $lim)) { if ($p -and -not $p.HasExited) { try { $p.Kill() } catch {} } }
 

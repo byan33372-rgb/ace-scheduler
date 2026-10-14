@@ -1,0 +1,66 @@
+{
+    "runs":  5,
+    "results":  [
+                    {
+                        "run":  1,
+                        "pass":  true,
+                        "ratio":  0.376,
+                        "m1":  2053,
+                        "m2":  772.6,
+                        "m4":  226.4,
+                        "applies":  5,
+                        "releases":  1,
+                        "engageSec":  1.7,
+                        "releaseSec":  4.4
+                    },
+                    {
+                        "run":  2,
+                        "pass":  true,
+                        "ratio":  0.368,
+                        "m1":  2168,
+                        "m2":  797.1,
+                        "m4":  228,
+                        "applies":  5,
+                        "releases":  1,
+                        "engageSec":  1.7,
+                        "releaseSec":  4.4
+                    },
+                    {
+                        "run":  3,
+                        "pass":  true,
+                        "ratio":  0.362,
+                        "m1":  2180,
+                        "m2":  788.9,
+                        "m4":  245.6,
+                        "applies":  5,
+                        "releases":  1,
+                        "engageSec":  1.7,
+                        "releaseSec":  4.5
+                    },
+                    {
+                        "run":  4,
+                        "pass":  true,
+                        "ratio":  0.374,
+                        "m1":  2128,
+                        "m2":  795.7,
+                        "m4":  224.4,
+                        "applies":  5,
+                        "releases":  1,
+                        "engageSec":  1.7,
+                        "releaseSec":  4.4
+                    },
+                    {
+                        "run":  5,
+                        "pass":  true,
+                        "ratio":  0.361,
+                        "m1":  2154,
+                        "m2":  778,
+                        "m4":  224.8,
+                        "applies":  5,
+                        "releases":  1,
+                        "engageSec":  1.7,
+                        "releaseSec":  4.1
+                    }
+                ],
+    "passCount":  5
+}
