@@ -28,6 +28,7 @@ public static class SelfTest
             ProbeSeconds = DoubleArg(args, "--probe-sec", 5),
         };
         var pollMs = IntArg(args, "--poll-ms", 500);
+        var foregroundFile = StrArg(args, "--foreground", "");
 
         Process target;
         try
@@ -76,13 +77,7 @@ public static class SelfTest
         while (true)
         {
             Thread.Sleep(pollMs);
-            try
-            {
-                using var fs = File.Open(controlFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-                using var sr = new StreamReader(fs);
-                if (sr.ReadToEnd().Trim() == "stop") break;
-            }
-            catch { }
+            if (ReadControl(controlFile) == "stop") break;
             try
             {
                 target.Refresh();
@@ -96,7 +91,8 @@ public static class SelfTest
 
             var bytes = IoSampler.GetCumulativeReadBytes(target.Id);
             if (bytes is null) continue;
-            var result = engine.OnSample(bytes.Value, DateTimeOffset.UtcNow);
+            var fgBusy = ReadControl(foregroundFile) != "idle"; // missing file / any other value = busy (legacy behavior)
+            var result = engine.OnSample(bytes.Value, DateTimeOffset.UtcNow, fgBusy);
             Log(new Evt(Utc(DateTimeOffset.UtcNow), "sample", result.State.ToString(), result.RateMBps, null));
         }
 
@@ -109,6 +105,18 @@ public static class SelfTest
     {
         var i = Array.IndexOf(args, name);
         return i >= 0 && i + 1 < args.Length ? args[i + 1] : fallback;
+    }
+
+    private static string? ReadControl(string? path)
+    {
+        if (string.IsNullOrEmpty(path)) return null;
+        try
+        {
+            using var fs = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var sr = new StreamReader(fs);
+            return sr.ReadToEnd().Trim();
+        }
+        catch { return null; }
     }
 
     private static int IntArg(string[] args, string name, int fallback)

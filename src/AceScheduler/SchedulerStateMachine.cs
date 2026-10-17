@@ -2,7 +2,12 @@ namespace AceScheduler;
 
 public enum SchedulerState
 {
+    /// <summary>No scan activity.</summary>
     Idle,
+    /// <summary>Scan burst detected but the desktop is idle - deliberately NOT
+    /// throttling, so the scan finishes fast and goes away (docs/design.md:
+    /// the objective is "the foreground never loses", not "ACE as slow as possible").</summary>
+    BurstIdle,
     Throttled,
     Probe,
 }
@@ -17,20 +22,30 @@ public sealed class SchedulerOptions
     /// <summary>Continuous throttled wall-time before a probe window opens.</summary>
     public double ProbeSeconds { get; init; } = 5;
 
-    /// <summary>Consecutive burst samples required to enter THROTTLED.</summary>
+    /// <summary>Consecutive burst samples required to leave Idle.</summary>
     public int BurstConfirmSamples { get; init; } = 2;
+
+    /// <summary>Quiet samples (rate below half the burst threshold) required to
+    /// declare a scan ended from BurstIdle.</summary>
+    public int QuietConfirmSamples { get; init; } = 2;
+
+    /// <summary>Force the foreground-busy signal on (overrides detection).</summary>
+    public bool AlwaysThrottle { get; init; }
 }
 
 public sealed record SchedulerEvent(DateTimeOffset Timestamp, string Kind, double RateMBps, string Detail);
 
 /// <summary>
-/// Port of trial/AceScheduler.Trial.ps1 (validated 5/5 PASS, 2026-10-14).
-/// IDLE -> (burst confirmed) THROTTLED -> (ProbeSeconds elapsed) PROBE ->
-/// rate still high = re-throttle / rate low = scan truly ended -> IDLE.
+/// v3: foreground-gated scheduler.
+/// IDLE -> burst confirmed -> foreground busy ? THROTTLED : BURST_IDLE.
+/// BURST_IDLE: foreground turns busy -> THROTTLED; rate quiet -> IDLE (scan
+/// finished without us ever throttling - the ideal outcome).
+/// THROTTLED -> after ProbeSeconds -> PROBE. PROBE has three outcomes:
+/// still scanning + foreground busy -> THROTTLED; still scanning + desktop
+/// idle -> BURST_IDLE (release so it finishes); ended -> IDLE.
 /// The probe prevents the starvation feedback loop: throttling collapses the
 /// scanner's IO rate, which by rate alone would fake a "scan ended" signal.
-/// Timing uses wall-clock deltas between samples, never tick counts - the CIM
-/// sampler runs ~1.3s/tick under load (see docs/design.md).
+/// Timing uses wall-clock deltas between samples, never tick counts.
 /// </summary>
 public sealed class SchedulerStateMachine
 {
@@ -40,6 +55,7 @@ public sealed class SchedulerStateMachine
 
     private SchedulerState _state = SchedulerState.Idle;
     private int _burstRun;
+    private int _quietRun;
     private double _throttledSeconds;
     private DateTimeOffset _lastTs;
     private double _lastBytes;
@@ -54,9 +70,11 @@ public sealed class SchedulerStateMachine
         _log = log;
     }
 
-    /// <summary>Feed one cumulative-read-bytes observation from the sampler.</summary>
-    public SampleResult OnSample(double cumulativeReadBytes, DateTimeOffset now)
+    /// <summary>Feed one cumulative-read-bytes observation plus the foreground-busy signal.</summary>
+    public SampleResult OnSample(double cumulativeReadBytes, DateTimeOffset now, bool foregroundBusy)
     {
+        if (_options.AlwaysThrottle) foregroundBusy = true;
+
         if (_lastTs == default)
         {
             _lastTs = now;
@@ -71,6 +89,7 @@ public sealed class SchedulerStateMachine
         if (dt < 0.2) return new SampleResult(_state, _lastRate); // clock not ready yet
         var mbps = dBytes / 1_048_576 / dt;
         _lastRate = mbps;
+        var busy = foregroundBusy;
 
         switch (_state)
         {
@@ -78,10 +97,40 @@ public sealed class SchedulerStateMachine
                 _burstRun = mbps >= _options.BurstMBs ? _burstRun + 1 : 0;
                 if (_burstRun >= _options.BurstConfirmSamples)
                 {
-                    _applyThrottle(true);
+                    if (busy)
+                    {
+                        Throttle(now, mbps, "burst detected, foreground busy");
+                        _state = SchedulerState.Throttled;
+                    }
+                    else
+                    {
+                        _state = SchedulerState.BurstIdle;
+                        _burstRun = 0;
+                        _log(new SchedulerEvent(now, "passthrough", mbps, "burst detected, desktop idle - letting it finish"));
+                    }
+                }
+                break;
+
+            case SchedulerState.BurstIdle:
+                if (busy)
+                {
+                    Throttle(now, mbps, "foreground turned busy mid-scan");
                     _state = SchedulerState.Throttled;
-                    _throttledSeconds = 0;
-                    _log(new SchedulerEvent(now, "throttle", mbps, "burst detected"));
+                }
+                else if (mbps < _options.BurstMBs / 2)
+                {
+                    _quietRun++;
+                    if (_quietRun >= _options.QuietConfirmSamples)
+                    {
+                        _state = SchedulerState.Idle;
+                        _burstRun = 0;
+                        _quietRun = 0;
+                        _log(new SchedulerEvent(now, "release", mbps, "scan ended (never throttled)"));
+                    }
+                }
+                else
+                {
+                    _quietRun = 0;
                 }
                 break;
 
@@ -98,14 +147,20 @@ public sealed class SchedulerStateMachine
             case SchedulerState.Probe:
                 if (mbps >= _options.BurstMBs)
                 {
-                    _applyThrottle(true);
-                    _state = SchedulerState.Throttled;
-                    _throttledSeconds = 0;
-                    _log(new SchedulerEvent(now, "rethrottle", mbps, "probe: still scanning"));
+                    if (busy)
+                    {
+                        Throttle(now, mbps, "probe: still scanning, foreground busy");
+                        _state = SchedulerState.Throttled;
+                    }
+                    else
+                    {
+                        _state = SchedulerState.BurstIdle;
+                        _burstRun = 0;
+                        _log(new SchedulerEvent(now, "passthrough", mbps, "probe: still scanning, desktop idle - released"));
+                    }
                 }
                 else
                 {
-                    _applyThrottle(false);
                     _state = SchedulerState.Idle;
                     _burstRun = 0;
                     _log(new SchedulerEvent(now, "release", mbps, "probe: scan ended"));
@@ -114,5 +169,14 @@ public sealed class SchedulerStateMachine
         }
 
         return new SampleResult(_state, mbps);
+    }
+
+    private void Throttle(DateTimeOffset now, double mbps, string detail)
+    {
+        _applyThrottle(true);
+        _throttledSeconds = 0;
+        _burstRun = 0;
+        _quietRun = 0;
+        _log(new SchedulerEvent(now, "throttle", mbps, detail));
     }
 }

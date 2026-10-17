@@ -39,7 +39,7 @@ void Tick(object? sender, EventArgs e)
     RetargetIfNeeded();
     if (target is null || engine is null) return;
     var bytes = IoSampler.GetCumulativeReadBytes(target.Id);
-    if (bytes.HasValue) engine.OnSample(bytes.Value, DateTimeOffset.UtcNow);
+    if (bytes.HasValue) engine.OnSample(bytes.Value, DateTimeOffset.UtcNow, ForegroundMonitor.IsFullscreenApp());
 }
 
 using var timer = new System.Windows.Forms.Timer { Interval = 500 };
