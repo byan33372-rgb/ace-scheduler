@@ -22,13 +22,24 @@ public static class TargetDiscovery
     /// <summary>First running scanner process, or null when ACE is dormant.</summary>
     public static Process? FindScanner()
     {
+        var all = FindScanners();
+        return all.Count > 0 ? all[0] : null;
+    }
+
+    /// <summary>All running scanner processes (ACE runs several at once).</summary>
+    public static List<Process> FindScanners()
+    {
+        var found = new List<Process>();
+        var seen = new HashSet<int>();
         foreach (var name in ScannerProcessNames)
         {
-            var processes = Process.GetProcessesByName(name);
-            if (processes.Length > 0) return processes[0];
-            foreach (var p in processes) p.Dispose();
+            foreach (var p in Process.GetProcessesByName(name))
+            {
+                if (seen.Add(p.Id)) found.Add(p);
+                else p.Dispose();
+            }
         }
-        return null;
+        return found;
     }
 
     /// <summary>True while any AntiCheatExpert* service is registered (installed even when stopped).</summary>

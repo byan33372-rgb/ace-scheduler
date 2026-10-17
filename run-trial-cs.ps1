@@ -8,8 +8,16 @@
 param()
 $ErrorActionPreference = 'Stop'
 function Set-Control([string]$path, [string]$value) {
-  for ($attempt = 0; $attempt -lt 10; $attempt++) {
-    try { $value | Set-Content $path -ErrorAction Stop; return } catch { Start-Sleep -Milliseconds 100 }
+  # write via a stream opened with FileShare.ReadWrite so we never collide
+  # with the control-file readers (they open with the same sharing mode)
+  for ($attempt = 0; $attempt -lt 40; $attempt++) {
+    try {
+      $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+      $bytes = [System.Text.Encoding]::UTF8.GetBytes($value)
+      $fs.Write($bytes, 0, $bytes.Length)
+      $fs.Dispose()
+      return
+    } catch { Start-Sleep -Milliseconds 150 }
   }
   throw "cannot write control file: $path"
 }

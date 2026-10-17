@@ -4,45 +4,54 @@ using System.Text.Json;
 namespace AceScheduler;
 
 /// <summary>
-/// Headless mode for the sandbox closed-loop validation (v0.2 release gate).
-/// Drives the production state machine against a caller-supplied target PID
-/// under the exact same file contract as trial/AceScheduler.Trial.ps1:
-/// a control file ('stop' exits) and a JSONL event log with matching event
-/// names (start/sample/burst-detected/probe-start/probe-scanning/scan-ended/
-/// target-gone/stop), so the trial orchestrator's verdict logic works
-/// unchanged with this engine swapped in.
+/// Headless mode for sandbox validation (v0.3 release gate).
+/// Multi-target: --target-pids "a,b,c" spins one independent state machine per
+/// scanner process with a shared foreground signal - mirroring reality, where
+/// ACE runs several scanner processes at once. Same file contract as the trial
+/// limiter (control file + JSONL events), plus a per-event "pid" field.
 /// </summary>
 public static class SelfTest
 {
-    private sealed record Evt(string ts, string evt, string? state, double? mbps, string? action);
+    private sealed record Evt(string ts, string evt, string? state, double? mbps, string? action, int? pid);
+
+    private sealed class TargetCtx
+    {
+        public required Process Proc;
+        public SchedulerStateMachine Engine = null!;
+        public DateTimeOffset LastTs;
+        public double LastBytes;
+    }
 
     public static int Run(string[] args)
     {
-        var targetPid = IntArg(args, "--target-pid", 0);
-        if (targetPid == 0) return 2;
+        var pids = new List<int>();
+        var multi = StrArg(args, "--target-pids", "");
+        if (!string.IsNullOrEmpty(multi))
+        {
+            foreach (var part in multi.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (int.TryParse(part, out var v)) pids.Add(v);
+            }
+        }
+        else
+        {
+            var single = IntArg(args, "--target-pid", 0);
+            if (single != 0) pids.Add(single);
+        }
+        if (pids.Count == 0) return 2;
+
         var controlFile = StrArg(args, "--control", "limiter.ctl");
         var logFile = StrArg(args, "--log", "limiter.jsonl");
+        var foregroundFile = StrArg(args, "--foreground", "");
         var options = new SchedulerOptions
         {
             BurstMBs = DoubleArg(args, "--burst-mbs", 5),
             ProbeSeconds = DoubleArg(args, "--probe-sec", 5),
         };
         var pollMs = IntArg(args, "--poll-ms", 500);
-        var foregroundFile = StrArg(args, "--foreground", "");
-
-        Process target;
-        try
-        {
-            target = Process.GetProcessById(targetPid);
-        }
-        catch
-        {
-            return 2;
-        }
-
         var fullMask = ProcessThrottle.FullAffinityMask();
 
-        void Log(Evt e)
+        void Log(int pid, Evt e)
         {
             try { File.AppendAllText(logFile, JsonSerializer.Serialize(e) + Environment.NewLine); }
             catch { /* logging must never kill the loop */ }
@@ -50,54 +59,87 @@ public static class SelfTest
 
         static string Utc(DateTimeOffset t) => t.UtcDateTime.ToString("o");
 
-        Log(new Evt(Utc(DateTimeOffset.UtcNow), "start", null, null,
-            $"target={targetPid} burstMBs={options.BurstMBs} probeSec={options.ProbeSeconds}"));
-
-        // warm up the WMI provider: the first query costs 1-2s and would widen
-        // the unthrottled window before the engine engages
-        IoSampler.GetCumulativeReadBytes(targetPid);
-
-        var engine = new SchedulerStateMachine(
-            options,
-            throttle => ProcessThrottle.Apply(target, throttle, fullMask),
-            ev =>
+        var targets = new List<TargetCtx>();
+        foreach (var pid in pids)
+        {
+            try
             {
-                // map to the trial limiter's event names so orchestrator verdicts stay comparable
-                var kind = ev.Kind switch
-                {
-                    "throttle" => "burst-detected",
-                    "probe" => "probe-start",
-                    "rethrottle" => "probe-scanning",
-                    "release" => "scan-ended",
-                    _ => ev.Kind,
-                };
-                Log(new Evt(Utc(ev.Timestamp), kind, null, ev.RateMBps, ev.Detail));
-            });
+                var proc = Process.GetProcessById(pid);
+                var ctx = new TargetCtx { Proc = proc };
+                ctx.Engine = new SchedulerStateMachine(
+                    options,
+                    throttle => ProcessThrottle.Apply(ctx.Proc, throttle, fullMask),
+                    ev =>
+                    {
+                        var kind = ev.Kind switch
+                        {
+                            "throttle" => "burst-detected",
+                            "probe" => "probe-start",
+                            "rethrottle" => "probe-scanning",
+                            "release" => "scan-ended",
+                            _ => ev.Kind,
+                        };
+                        Log(pid, new Evt(Utc(ev.Timestamp), kind, null, ev.RateMBps, ev.Detail, pid));
+                    });
+                targets.Add(ctx);
+                Log(pid, new Evt(Utc(DateTimeOffset.UtcNow), "start", null, null,
+                    $"target={pid} burstMBs={options.BurstMBs} probeSec={options.ProbeSeconds}", pid));
+            }
+            catch
+            {
+                Log(pid, new Evt(Utc(DateTimeOffset.UtcNow), "target-unopenable", null, null, null, pid));
+            }
+        }
+        if (targets.Count == 0) return 2;
+
+        IoSampler.GetCumulativeReadBytes(targets[0].Proc.Id); // warm up the sampler
 
         while (true)
         {
             Thread.Sleep(pollMs);
             if (ReadControl(controlFile) == "stop") break;
-            try
-            {
-                target.Refresh();
-                if (target.HasExited)
-                {
-                    Log(new Evt(Utc(DateTimeOffset.UtcNow), "target-gone", null, null, null));
-                    break;
-                }
-            }
-            catch { break; }
+            var fgBusy = ReadControl(foregroundFile) != "idle"; // missing file / any other value = busy
+            var now = DateTimeOffset.UtcNow;
 
-            var bytes = IoSampler.GetCumulativeReadBytes(target.Id);
-            if (bytes is null) continue;
-            var fgBusy = ReadControl(foregroundFile) != "idle"; // missing file / any other value = busy (legacy behavior)
-            var result = engine.OnSample(bytes.Value, DateTimeOffset.UtcNow, fgBusy);
-            Log(new Evt(Utc(DateTimeOffset.UtcNow), "sample", result.State.ToString(), result.RateMBps, null));
+            var gone = new List<int>();
+            foreach (var ctx in targets.ToArray())
+            {
+                try
+                {
+                    ctx.Proc.Refresh();
+                    if (ctx.Proc.HasExited)
+                    {
+                        Log(ctx.Proc.Id, new Evt(Utc(now), "target-gone", null, null, null, ctx.Proc.Id));
+                        gone.Add(ctx.Proc.Id);
+                        continue;
+                    }
+                }
+                catch
+                {
+                    gone.Add(ctx.Proc.Id);
+                    continue;
+                }
+
+                var bytes = IoSampler.GetCumulativeReadBytes(ctx.Proc.Id);
+                if (bytes is null) continue;
+                var result = ctx.Engine.OnSample(bytes.Value, now, fgBusy);
+                Log(ctx.Proc.Id, new Evt(Utc(now), "sample", result.State.ToString(), result.RateMBps, null, ctx.Proc.Id));
+            }
+            foreach (var pid in gone)
+            {
+                var ctx = targets.First(t => t.Proc.Id == pid);
+                try { ctx.Proc.Dispose(); } catch { }
+                targets.Remove(ctx);
+            }
+            if (targets.Count == 0)
+            {
+                Log(0, new Evt(Utc(DateTimeOffset.UtcNow), "all-targets-gone", null, null, null, 0));
+                break;
+            }
         }
 
-        Log(new Evt(Utc(DateTimeOffset.UtcNow), "stop", engine.State.ToString(), null, null));
-        try { target.Dispose(); } catch { }
+        Log(0, new Evt(Utc(DateTimeOffset.UtcNow), "stop", null, null, null, 0));
+        foreach (var ctx in targets) { try { ctx.Proc.Dispose(); } catch { } }
         return 0;
     }
 
