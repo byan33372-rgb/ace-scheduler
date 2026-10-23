@@ -9,8 +9,10 @@ if (args.Length > 0 && args[0] == "--selftest")
 var options = new SchedulerOptions();
 var fullMask = ProcessThrottle.FullAffinityMask();
 var targets = new Dictionary<int, TargetEntry>();
+var monitor = new SessionMonitor();
 NotifyIcon? notifyIcon = null;
 Form? panel = null;
+int _tickCount = 0;
 Label statusLabel = null!;
 Button toggleButton = null!;
 System.Windows.Forms.Timer? timer = null;
@@ -44,6 +46,7 @@ void LogEvent(int pid, SchedulerEvent ev)
     var line = $"pid={pid} {ev.Kind} {ev.RateMBps:F0}MB/s {ev.Detail}";
     Debug.WriteLine($"[{ev.Timestamp:HH:mm:ss}] {line}");
     FileLogger.Write(line);
+    monitor.EngineEvent(pid, ev.Kind, ev.Detail);
 }
 
 void RetargetIfNeeded()
@@ -63,6 +66,7 @@ void RetargetIfNeeded()
         targets[pid].Dispose();
         ProcessThrottle.Forget(pid);
         targets.Remove(pid);
+        monitor.ScannerGone(pid, DateTimeOffset.UtcNow);
     }
 
     foreach (var proc in TargetDiscovery.FindScanners())
@@ -78,6 +82,7 @@ void RetargetIfNeeded()
             throttle => ProcessThrottle.Apply(proc.Id, throttle, fullMask),
             ev => LogEvent(proc.Id, ev));
         targets[proc.Id] = new TargetEntry { Proc = proc, Engine = engine };
+        monitor.ScannerFound(proc.Id, proc.ProcessName, DateTimeOffset.UtcNow);
         FileLogger.Write($"target adopted: pid={proc.Id}");
     }
 }
@@ -110,6 +115,7 @@ void SetEnabled(bool enabled)
     schedulerEnabled = enabled;
     PersistEnabled();
     FileLogger.Write(enabled ? "scheduler enabled by user" : "scheduler disabled by user");
+    monitor.Log("scheduler", enabled ? "enabled" : "disabled");
     if (!enabled)
     {
         // stop sampling AND release every throttle we currently hold
@@ -131,16 +137,24 @@ void SetEnabled(bool enabled)
 void Tick(object? sender, EventArgs e)
 {
     RetargetIfNeeded();
+    _tickCount++;
+    if (_tickCount % 2 == 0) monitor.PollGames(DateTimeOffset.UtcNow);
+    monitor.TickCloseCheck(DateTimeOffset.UtcNow);
     if (targets.Count == 0) { RefreshUi(); return; }
     var fg = ForegroundMonitor.IsFullscreenApp();
     var now = DateTimeOffset.UtcNow;
     foreach (var entry in targets.Values)
     {
         var bytes = IoSampler.GetCumulativeReadBytes(entry.Proc.Id);
-        if (bytes.HasValue) entry.Engine.OnSample(bytes.Value, now, fg);
+        if (bytes.HasValue)
+        {
+            var result = entry.Engine.OnSample(bytes.Value, now, fg);
+            monitor.EngineSample(entry.Proc.Id, result.RateMBps, result.State.ToString(), now);
+        }
     }
     RefreshUi();
 }
+
 
 System.Drawing.Icon trayImage = SystemIcons.Shield;
 try
@@ -195,6 +209,19 @@ toggleItem.Click += (_, _) => { SetEnabled(!schedulerEnabled); SyncToggleItem();
 SyncToggleItem();
 menu.Items.Add(toggleItem);
 menu.Items.Add(new ToolStripSeparator());
+menu.Items.Add("打开监测报告", null, (_, _) =>
+{
+    try
+    {
+        var dir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "mvxxcb-restrain", "sessions");
+        Directory.CreateDirectory(dir);
+        Process.Start(new ProcessStartInfo(dir) { UseShellExecute = true });
+    }
+    catch { }
+});
+menu.Items.Add(new ToolStripSeparator());
 menu.Items.Add("打开日志", null, (_, _) =>
 {
     try { Process.Start(new ProcessStartInfo(FileLogger.LogPath) { UseShellExecute = true }); } catch { }
@@ -203,6 +230,7 @@ menu.Items.Add(new ToolStripSeparator());
 menu.Items.Add("退出", null, (_, _) =>
 {
     SetEnabled(false); // restore everything we throttled before leaving
+    monitor.ForceClose("app exit");
     notifyIcon.Visible = false;
     Application.Exit();
 });
