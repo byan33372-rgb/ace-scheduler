@@ -5,8 +5,8 @@
 param([string]$Version = '0.3.0')
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$sdkDir = Join-Path $env:LOCALAPPDATA 'Microsoft\dotnet'
-$dotnet = if (Test-Path (Join-Path $sdkDir 'dotnet.exe')) { Join-Path $sdkDir 'dotnet.exe' } else { 'dotnet' }
+$dotnet = @('D:\dev\dotnet\dotnet.exe', (Join-Path $env:LOCALAPPDATA 'Microsoft\dotnet\dotnet.exe')) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $dotnet) { $dotnet = 'dotnet' }
 
 & $dotnet publish (Join-Path $repoRoot 'src\AceScheduler') `
   -c Release -r win-x64 --self-contained `
