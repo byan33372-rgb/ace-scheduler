@@ -23,7 +23,7 @@ function Set-Control([string]$path, [string]$value) {
 }
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $dir
-$appExe   = Join-Path $dir 'dist\AceScheduler.exe'
+$appExe   = Join-Path $dir 'dist\mvxxcb-restrain.exe'
 $trial    = Join-Path $dir 'trial'
 $bin      = Join-Path $dir 'dummy.bin'
 $dummyLog = Join-Path $dir 'dummy.log'
@@ -42,7 +42,7 @@ $me = $PID
 $zombies = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object {
   $_.ProcessId -ne $me -and $_.CommandLine -match 'DummyScanner\.ps1|ForegroundSim\.ps1|AceScheduler\.Trial\.ps1'
 })
-$zombiesExe = @(Get-Process AceScheduler -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $me })
+$zombiesExe = @(Get-Process mvxxcb-restrain -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne $me })
 foreach ($z in $zombies) { try { Stop-Process -Id $z.ProcessId -Force -ErrorAction Stop } catch {} }
 foreach ($z in $zombiesExe) { try { Stop-Process -Id $z.Id -Force -ErrorAction Stop } catch {} }
 if ($zombies.Count + $zombiesExe.Count -gt 0) { Write-Host "zombie helpers killed: $($zombies.Count + $zombiesExe.Count)" }

@@ -65,14 +65,22 @@ timer.Tick += Tick;
 timer.Start();
 
 var menu = new ContextMenuStrip();
-menu.Items.Add($"AceScheduler v0.3 ({options.BurstMBs:F0}MB/s threshold)", null, (_, _) => { });
+menu.Items.Add($"mvxxcb-restrain v0.3 ({options.BurstMBs:F0}MB/s threshold)", null, (_, _) => { });
 menu.Items.Add(new ToolStripSeparator());
 menu.Items.Add("Exit", null, (_, _) => Application.Exit());
 
+System.Drawing.Icon trayImage = SystemIcons.Shield;
+try
+{
+    if (Environment.ProcessPath is not null)
+        trayImage = System.Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath) ?? trayImage;
+}
+catch { }
+
 var notifyIcon = new NotifyIcon
 {
-    Icon = SystemIcons.Shield,
-    Text = "AceScheduler - scheduling ACE scans",
+    Icon = trayImage,
+    Text = "mvxxcb-restrain - scheduling background scans",
     ContextMenuStrip = menu,
     Visible = true,
 };
