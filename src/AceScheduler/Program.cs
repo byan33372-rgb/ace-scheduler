@@ -19,6 +19,7 @@ var options = new SchedulerOptions();
 var fullMask = ProcessThrottle.FullAffinityMask();
 var gate = new object();                     // guards targets + shared reads
 var targets = new Dictionary<int, TargetEntry>();
+var goneAt = new Dictionary<int, DateTimeOffset>(); // re-adoption cooldown (anti-flap)
 var monitor = new SessionMonitor();
 var shared = new SharedState();
 NotifyIcon? notifyIcon = null;
@@ -26,6 +27,10 @@ Form? panel = null;
 Label statusLabel = null!;
 Button toggleButton = null!;
 ToolStripMenuItem toggleItem = null!;
+
+bool elevated = SessionMonitor.IsElevated();
+monitor.SetElevated(elevated);
+FileLogger.Write($"running elevated: {elevated}");
 
 // persisted on/off state: the launcher remembers the user's last choice
 try
@@ -57,43 +62,47 @@ void LogEvent(int pid, SchedulerEvent ev)
     monitor.EngineEvent(pid, ev.Kind, ev.Detail);
 }
 
-void RetargetIfNeeded()
+const int NullStreakLimit = 10;      // ~5s of unreadable IO counters = gone
+const double ReadoptCooldownSec = 15; // same pid must stay gone this long before re-adoption
+
+/// <summary>
+/// Liveness is sampler-based: a target is dead only when its IO counters are
+/// unreadable for NullStreakLimit consecutive ticks. We never hold Process
+/// objects - Refresh()/HasExited throw access-denied for SYSTEM-owned scanner
+/// processes and previously caused 582 adopt/drop flaps per hour.
+/// </summary>
+void RetargetIfNeeded(DateTimeOffset now)
 {
     lock (gate)
     {
         var dead = new List<int>();
         foreach (var (pid, entry) in targets)
         {
-            try
-            {
-                entry.Proc.Refresh();
-                if (entry.Proc.HasExited) dead.Add(pid);
-            }
-            catch { dead.Add(pid); }
+            if (entry.NullStreak >= NullStreakLimit) dead.Add(pid);
         }
         foreach (var pid in dead)
         {
-            targets[pid].Dispose();
-            ProcessThrottle.Forget(pid);
             targets.Remove(pid);
-            monitor.ScannerGone(pid, DateTimeOffset.UtcNow);
+            goneAt[pid] = now;
+            monitor.ScannerGone(pid, now);
         }
 
         foreach (var proc in TargetDiscovery.FindScanners())
         {
-            if (targets.ContainsKey(proc.Id))
-            {
-                proc.Dispose();
-                continue;
-            }
-            IoSampler.GetCumulativeReadBytes(proc.Id); // prime the sampler
-            var engine = new SchedulerStateMachine(
+            var pid = proc.Id;
+            var name = proc.ProcessName;
+            proc.Dispose(); // read what we need, drop the handle immediately
+            if (targets.ContainsKey(pid)) continue;
+            if (goneAt.TryGetValue(pid, out var at) && (now - at).TotalSeconds < ReadoptCooldownSec) continue;
+
+            var entry = new TargetEntry { Pid = pid, Name = name };
+            entry.Engine = new SchedulerStateMachine(
                 options,
-                throttle => ProcessThrottle.Apply(proc.Id, throttle, fullMask),
-                ev => LogEvent(proc.Id, ev));
-            targets[proc.Id] = new TargetEntry { Proc = proc, Engine = engine };
-            monitor.ScannerFound(proc.Id, proc.ProcessName, DateTimeOffset.UtcNow);
-            FileLogger.Write($"target adopted: pid={proc.Id}");
+                throttle => ProcessThrottle.Apply(pid, throttle, fullMask),
+                ev => LogEvent(pid, ev));
+            targets[pid] = entry;
+            monitor.ScannerFound(pid, name, now);
+            FileLogger.Write($"target adopted: pid={pid} name={name}");
         }
     }
 }
@@ -106,15 +115,16 @@ void RetargetIfNeeded()
         count = targets.Count;
         err = targets.Values.FirstOrDefault(t => t.Engine.LastError is not null)?.Engine.LastError;
     }
-    if (!shared.Enabled) return ("当前状态：已停用（不干预任何进程）", "mvxxcb-restrain | 已停用");
-    if (count == 0) return ("当前状态：运行中，未发现扫描进程", "mvxxcb-restrain | 运行中，未发现扫描进程");
+    var elevTag = elevated ? "" : " | 未提权";
+    if (!shared.Enabled) return ("当前状态：已停用（不干预任何进程）", "mvxxcb-restrain | 已停用" + elevTag);
+    if (count == 0) return ("当前状态：运行中，未发现扫描进程", "mvxxcb-restrain | 运行中，未发现扫描进程" + elevTag);
     if (err is not null)
     {
         var s = $"当前状态：限速失败（{err}）";
-        return (s, Trim63("mvxxcb-restrain | " + s[5..]));
+        return (s, Trim63("mvxxcb-restrain | " + s[5..] + elevTag));
     }
     var t = $"当前状态：调度中，目标进程 {count} 个";
-    return (t, "mvxxcb-restrain | " + t[5..]);
+    return (t, Trim63("mvxxcb-restrain | " + t[5..] + elevTag));
 }
 
 static string Trim63(string s) => s.Length > 63 ? s[..63] : s;
@@ -164,35 +174,40 @@ void SetEnabled(bool enabled)
 }
 
 // ---------------- background worker: all discovery/sampling off the UI thread ----------------
-int tick = 0;
 void WorkerLoop()
 {
+    var lastTick = DateTimeOffset.UtcNow;
     while (true)
     {
         Thread.Sleep(500);
         try
         {
             var now = DateTimeOffset.UtcNow;
+            var dt = (now - lastTick).TotalSeconds;
+            lastTick = now;
+
+            var fg = ForegroundMonitor.IsFullscreenApp();
+            monitor.Foreground(fg, now);
             monitor.PollGames(now);
             monitor.TickCloseCheck(now);
+
             if (shared.Enabled)
             {
-                RetargetIfNeeded();
-                tick++;
-                if (targets.Count > 0)
+                RetargetIfNeeded(now);
+                lock (gate)
                 {
-                    var fg = ForegroundMonitor.IsFullscreenApp();
-                    lock (gate)
+                    foreach (var entry in targets.Values)
                     {
-                        foreach (var entry in targets.Values)
+                        var bytes = IoSampler.GetCumulativeReadBytes(entry.Pid);
+                        if (bytes is null)
                         {
-                            var bytes = IoSampler.GetCumulativeReadBytes(entry.Proc.Id);
-                            if (bytes.HasValue)
-                            {
-                                var result = entry.Engine.OnSample(bytes.Value, now, fg);
-                                monitor.EngineSample(entry.Proc.Id, result.RateMBps, result.State.ToString(), now);
-                            }
+                            entry.NullStreak++;
+                            monitor.SampleDenied(entry.Pid, now);
+                            continue;
                         }
+                        entry.NullStreak = 0;
+                        var result = entry.Engine.OnSample(bytes.Value, now, fg);
+                        monitor.EngineSample(entry.Pid, result.RateMBps, result.State.ToString(), now, dt);
                     }
                 }
             }
@@ -221,7 +236,7 @@ panel = new Form
     MaximizeBox = false,
     MinimizeBox = false,
     StartPosition = FormStartPosition.CenterScreen,
-    ClientSize = new System.Drawing.Size(360, 150),
+    ClientSize = new System.Drawing.Size(360, 170),
     ShowInTaskbar = false,
 };
 statusLabel = new Label
@@ -229,17 +244,26 @@ statusLabel = new Label
     Text = "当前状态：…",
     AutoSize = false,
     TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
-    Location = new System.Drawing.Point(16, 20),
-    Size = new System.Drawing.Size(328, 40),
+    Location = new System.Drawing.Point(16, 16),
+    Size = new System.Drawing.Size(328, 30),
+};
+var elevLabel = new Label
+{
+    Text = elevated ? "运行权限：已提权" : "运行权限：普通（未提权，系统级扫描进程可能无法观测，详见日志）",
+    AutoSize = false,
+    ForeColor = elevated ? System.Drawing.Color.Green : System.Drawing.Color.DarkOrange,
+    Location = new System.Drawing.Point(16, 48),
+    Size = new System.Drawing.Size(328, 30),
 };
 toggleButton = new Button
 {
     Text = "…",
-    Location = new System.Drawing.Point(16, 75),
+    Location = new System.Drawing.Point(16, 88),
     Size = new System.Drawing.Size(328, 45),
 };
 toggleButton.Click += (_, _) => SetEnabled(!shared.Enabled);
 panel.Controls.Add(statusLabel);
+panel.Controls.Add(elevLabel);
 panel.Controls.Add(toggleButton);
 panel.FormClosing += (_, e) =>
 {
@@ -319,13 +343,11 @@ sealed class SharedState
     public volatile bool Enabled = true;
 }
 
-sealed class TargetEntry : IDisposable
+/// <summary>No Process object held: liveness is sampler-based (NullStreak).</summary>
+sealed class TargetEntry
 {
-    public required Process Proc;
-    public required SchedulerStateMachine Engine;
-
-    public void Dispose()
-    {
-        try { Proc.Dispose(); } catch { }
-    }
+    public required int Pid;
+    public required string Name;
+    public SchedulerStateMachine Engine = null!;
+    public int NullStreak;
 }
