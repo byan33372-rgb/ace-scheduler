@@ -25,7 +25,6 @@ public sealed class SessionMonitor
         public int Samples;
         public int DeniedSamples;
         public double ThrottledSeconds;
-        public bool IsThrottled;
         public DateTimeOffset FirstSeen;
         public DateTimeOffset LastSeen;
         public DateTimeOffset LastRateLog;
@@ -307,6 +306,7 @@ public sealed class SessionMonitor
             _sessionFile = null; _sessionStart = null; _scans.Clear();
             _lastScanSeen = null; _gameExitAt = null; _gameStartAt = null;
             _fgLastTick = null; _fgBusySeconds = 0; _fgTotalSeconds = 0; _finished.Clear();
+            _gamesPresent.Clear(); // a fresh session must re-observe game-start
         }
     }
 
@@ -321,6 +321,7 @@ public sealed class SessionMonitor
             _sessionFile = null; _sessionStart = null; _scans.Clear();
             _lastScanSeen = null; _gameExitAt = null; _gameStartAt = null;
             _fgLastTick = null; _fgBusySeconds = 0; _fgTotalSeconds = 0; _finished.Clear();
+            _gamesPresent.Clear(); // a fresh session must re-observe game-start
         }
     }
 

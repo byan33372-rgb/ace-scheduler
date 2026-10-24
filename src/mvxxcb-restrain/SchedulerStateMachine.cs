@@ -168,6 +168,7 @@ public sealed class SchedulerStateMachine
                 {
                     _state = SchedulerState.Idle;
                     _burstRun = 0;
+                    LastError = null; // scan ended cleanly - stale errors no longer apply
                     _log(new SchedulerEvent(now, "release", mbps, "probe: scan ended"));
                 }
                 break;

@@ -18,8 +18,6 @@ public static class SelfTest
     {
         public required Process Proc;
         public SchedulerStateMachine Engine = null!;
-        public DateTimeOffset LastTs;
-        public double LastBytes;
         public int NullStreak; // sampler-based liveness, same rule as Program.cs
     }
 

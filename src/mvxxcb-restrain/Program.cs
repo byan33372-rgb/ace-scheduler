@@ -69,11 +69,12 @@ catch { }
 try
 {
     // crash recovery: restore anything the previous run left throttled.
-    // live pids with a matching creation time get their originals back;
-    // stale/reused entries are dropped silently.
-    var (attempted, restored) = ProcessThrottle.RecoverAtStartup();
-    if (attempted > 0)
-        FileLogger.Write($"startup journal recovery: {restored}/{attempted} target(s) restored from previous run");
+    // Transactional: entries that cannot be restored yet (e.g. access
+    // denied against a protected target while non-elevated) stay journaled
+    // and are retried on the next start; invalid entries are dropped loudly.
+    var (kept, restored, droppedInvalid) = ProcessThrottle.RecoverAtStartup();
+    if (restored > 0 || kept > 0 || droppedInvalid > 0)
+        FileLogger.Write($"startup journal recovery: restored={restored}, kept-for-retry={kept}, dropped-invalid={droppedInvalid}");
 }
 catch { }
 
@@ -139,8 +140,23 @@ void RetargetIfNeeded(DateTimeOffset now)
         {
             if (entry.NullStreak < NullStreakLimit) continue;
             var alive = false;
-            try { _ = Process.GetProcessById(pid); alive = true; } catch (ArgumentException) { }
-            if (alive)
+            var sameIdentity = true;
+            try
+            {
+                var p = Process.GetProcessById(pid);
+                alive = true;
+                // identity check: pid reuse must not pass the liveness probe
+                if (entry.CreatedAtFiletime.HasValue)
+                {
+                    try
+                    {
+                        if (p.StartTime.ToFileTime() != entry.CreatedAtFiletime.Value) sameIdentity = false;
+                    }
+                    catch { /* start time unreadable: keep the conservative verdict */ }
+                }
+            }
+            catch (ArgumentException) { }
+            if (alive && sameIdentity)
             {
                 // sampler outage on a live target: keep target + snapshot,
                 // keep any throttle as-is; log at most once a minute
@@ -152,6 +168,11 @@ void RetargetIfNeeded(DateTimeOffset now)
                 }
                 continue;
             }
+            if (alive && !sameIdentity)
+            {
+                // the pid now belongs to someone else: treat the old target as dead
+                FileLogger.Write($"pid={pid} was reused by a different process - treating old target as dead");
+            }
             dead.Add(pid);
         }
         foreach (var pid in dead)
@@ -159,11 +180,12 @@ void RetargetIfNeeded(DateTimeOffset now)
             var everSampled = targets[pid].EverSampled;
             var name = targets[pid].Name;
             targets.Remove(pid);
-            // try to restore before dropping: the process may still be in
-            // teardown where SetPriorityClass works; anything left over is
-            // unrecoverable, but the snapshot must never outlive the target
-            var err = ProcessThrottle.TryRecoverBeforeForget(pid, name, fullMask);
-            if (err is not null) FileLogger.Write($"pid={pid} final restore attempt: {err}");
+            // Best-effort release; only a confirmed restore or confirmed death
+            // discards the snapshot - access-denied/partial failures stay
+            // journaled for the next startup (review P0-B/P1-5).
+            var (outcome, err) = ProcessThrottle.TryRecoverBeforeForget(pid, name, fullMask);
+            if (err is not null || outcome != ProcessThrottle.RecoverOutcome.Gone && outcome != ProcessThrottle.RecoverOutcome.Restored)
+                FileLogger.Write($"pid={pid} final recover: outcome={outcome}" + (err is null ? "" : $", {err}"));
             goneUntil[pid] = now.AddSeconds(everSampled ? ReadoptCooldownSec : DeniedCooldownSec);
             if (!everSampled)
                 FileLogger.Write($"pid={pid} was never observable (access denied?) - re-adoption backed off {DeniedCooldownSec:F0}s; run elevated to observe SYSTEM scanners");
@@ -174,11 +196,13 @@ void RetargetIfNeeded(DateTimeOffset now)
         {
             var pid = proc.Id;
             var name = proc.ProcessName;
+            long? createdAt = null;
+            try { createdAt = proc.StartTime.ToFileTime(); } catch { }
             proc.Dispose(); // read what we need, drop the handle immediately
             if (targets.ContainsKey(pid)) continue;
             if (goneUntil.TryGetValue(pid, out var until) && now < until) continue;
 
-            var entry = new TargetEntry { Pid = pid, Name = name };
+            var entry = new TargetEntry { Pid = pid, Name = name, CreatedAtFiletime = createdAt };
             entry.Engine = new SchedulerStateMachine(
                 options,
                 throttle => ProcessThrottle.Apply(pid, name, throttle, fullMask),
@@ -321,15 +345,18 @@ void WorkerLoop()
             {
                 // the disable raced nothing: this runs after any in-flight
                 // tick, under the same lock, so a late re-throttle cannot
-                // survive; snapshots of unrecoverable targets stay journaled.
-                // Release ONCE, then drop tracking - re-enabling re-adopts.
-                // Without the drop this loop re-released (and re-logged)
-                // every 500ms while disabled.
+                // survive. Release once, then drop tracking - re-enabling
+                // re-adopts. The monitor is told so the session timeline and
+                // summary see the targets go instead of waiting for exit.
                 lock (gate)
                 {
                     if (targets.Count > 0)
                     {
                         DoReleaseAll();
+                        foreach (var pid in targets.Keys)
+                        {
+                            monitor.ScannerGone(pid, now);
+                        }
                         targets.Clear();
                     }
                 }
@@ -453,7 +480,7 @@ menu.Items.Add("退出", null, (_, _) =>
     lock (gate) shared.Enabled = false;
     lock (gate) DoReleaseAll();
     monitor.ForceClose("app exit");
-    notifyIcon.Visible = false;
+    if (notifyIcon is not null) notifyIcon.Visible = false;
     Application.Exit();
 });
 
@@ -501,4 +528,5 @@ sealed class TargetEntry
     public int NullStreak;
     public bool EverSampled; // false at death = observation-denied -> long re-adoption backoff
     public DateTimeOffset LastObserveLostLog = DateTimeOffset.MinValue; // rate-limits sampler-outage logs
+    public long? CreatedAtFiletime; // pid-reuse guard: the adopted process's identity
 }

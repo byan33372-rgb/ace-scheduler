@@ -11,14 +11,24 @@ public sealed record ThrottleSnapshot(uint PriorityClass, IntPtr Affinity, int? 
 /// captured the original IO priority - otherwise we could never restore it)
 /// + single-core affinity.
 ///
-/// Recovery safety (external review P0-1/P0-2):
+/// Recovery safety:
 /// - all-or-nothing: any failed write rolls back every applied property.
-/// - Release attempts all three properties independently and verifies each
-///   readback; the snapshot survives a partial failure for retry.
-/// - Snapshots are journaled to disk (pid + creation time + originals). On
-///   startup the journal is replayed: live processes with matching creation
-///   time are restored, stale/reused pids are dropped. This covers crashes,
-///   kills, logoff - anything that skips the graceful release path.
+/// - Release restores all three properties independently with readback
+///   verification (IO verified when queryable); partial failure keeps the
+///   snapshot for retry.
+/// - PID identity: every operation on an existing snapshot first verifies the
+///   live process creation time; a mismatch (pid reuse) discards the snapshot
+///   instead of writing it onto the innocent process.
+/// - Journal trust boundary: entries are validated on read (creation time
+///   present, priority class in the legal set, affinity within the system
+///   mask, IO priority in range, name in the scanner allowlist, bounded
+///   size/count). Invalid entries are dropped loudly.
+/// - Startup recovery is transactional: the journal is never cleared up
+///   front; each entry's fate is decided individually (restored/gone ->
+///   removed; access denied/other failure -> KEPT for the next attempt) and
+///   the remainder is written back atomically.
+/// - Fail-closed: when the journal cannot be persisted, new throttles are
+///   refused (an unrecoverable throttle is worse than no throttle).
 /// </summary>
 public static class ProcessThrottle
 {
@@ -28,13 +38,29 @@ public static class ProcessThrottle
     private const uint RightsNeeded = RightSetInformation | RightQueryInformation | RightQueryLimited;
 
     private const int ProcessIoPriority = 0x21;
+    private const int ErrorAccessDenied = 5;
+    private const int ErrorInvalidParameter = 87;
+
+    private static readonly uint[] LegalPriorityClasses =
+    {
+        0x0020, // NORMAL
+        0x0040, // IDLE
+        0x0080, // HIGH
+        0x0100, // REALTIME
+        0x4000, // BELOW_NORMAL
+        0x8000, // ABOVE_NORMAL
+    };
 
     private static readonly Dictionary<int, ThrottleSnapshot> Snapshots = new();
     private static readonly object Gate = new();
     private static string? _journalPath;
+    private static bool _journalHealthy = true;
+    private static bool _journalFailureLogged;
 
     private sealed record JournalEntry(int pid, string name, long? createdAt, uint priorityClass, long affinity, int? ioPriority);
     private sealed record JournalFile(List<JournalEntry> entries);
+
+    public enum RecoverOutcome { Restored, Gone, PidReused, KeptForRetry }
 
     /// <summary>Point the journal at its file; called once at startup.</summary>
     public static void Configure(string journalPath) => _journalPath = journalPath;
@@ -55,18 +81,51 @@ public static class ProcessThrottle
     }
 
     /// <summary>
-    /// Best-effort release before dropping a target for good (process dying).
-    /// Restore may be impossible; we still clear the snapshot and journal so
-    /// a reused pid can never inherit it.
+    /// Best-effort release before dropping a target. Only a confirmed
+    /// restore or a confirmed death may discard the snapshot; anything else
+    /// (access denied, partial restore) keeps it journaled so the next
+    /// startup or re-adoption can retry. Returns the outcome plus an error
+    /// text when the restore attempt failed.
     /// </summary>
-    public static string? TryRecoverBeforeForget(int processId, string processName, IntPtr fullAffinityMask)
+    public static (RecoverOutcome Outcome, string? Error) TryRecoverBeforeForget(int processId, string processName, IntPtr fullAffinityMask)
     {
-        var err = Apply(processId, processName, false, fullAffinityMask);
-        Forget(processId);
-        return err;
+        lock (Gate)
+        {
+            if (!Snapshots.ContainsKey(processId)) return (RecoverOutcome.Gone, null); // nothing of ours to restore
+        }
+        var handle = OpenProcess(RightsNeeded, false, processId);
+        if (handle == IntPtr.Zero)
+        {
+            var err = Marshal.GetLastWin32Error();
+            if (err == ErrorAccessDenied)
+            {
+                return (RecoverOutcome.KeptForRetry, $"OpenProcess access denied (err 5) - snapshot kept journaled for the next startup");
+            }
+            Forget(processId); // really gone (err 87 etc.)
+            return (RecoverOutcome.Gone, null);
+        }
+        try
+        {
+            if (!CreationMatches(handle, processId, out var mismatchReason) && mismatchReason is not null)
+            {
+                Forget(processId); // pid reused: the innocent process must not receive the old snapshot
+                return (RecoverOutcome.PidReused, mismatchReason);
+            }
+            var err2 = Apply(processId, processName, false, fullAffinityMask);
+            if (err2 is null)
+            {
+                Forget(processId);
+                return (RecoverOutcome.Restored, null);
+            }
+            return (RecoverOutcome.KeptForRetry, err2); // keep the snapshot for retry
+        }
+        finally
+        {
+            CloseHandle(handle);
+        }
     }
 
-    /// <summary>Drop a snapshot unconditionally (used after successful release paths).</summary>
+    /// <summary>Drop a snapshot unconditionally (only after confirmed restore/gone).</summary>
     public static void Forget(int processId)
     {
         lock (Gate)
@@ -77,43 +136,53 @@ public static class ProcessThrottle
     }
 
     /// <summary>
-    /// Replay the startup journal: restore live processes whose creation time
-    /// matches (protects against pid reuse), drop everything else. Returns
-    /// (attempted, restored).
+    /// Transactional startup recovery. The journal is validated, then each
+    /// entry decides its own fate: restored / confirmed gone / pid reused ->
+    /// removed; access denied / partial restore failure -> KEPT. The
+    /// remainder is written back atomically, so a non-elevated start against
+    /// a protected target loses nothing (the next elevated start retries).
+    /// Returns (kept_entries, restored, dropped_invalid).
     /// </summary>
-    public static (int attempted, int restored) RecoverAtStartup()
+    public static (int kept, int restored, int droppedInvalid) RecoverAtStartup()
     {
-        var entries = ReadJournal();
-        if (entries.Count == 0) return (0, 0);
-        // start clean; re-add only entries that fail to restore
-        lock (Gate)
-        {
-            Snapshots.Clear();
-            WriteJournalLocked();
-        }
+        var (entries, droppedInvalid) = ReadJournalValidated();
+        if (entries.Count == 0 && droppedInvalid == 0) return (0, 0, droppedInvalid);
+        var remaining = new List<JournalEntry>(entries);
         var restored = 0;
+
+        lock (Gate) Snapshots.Clear();
+
         foreach (var e in entries)
         {
             var handle = OpenProcess(RightsNeeded, false, e.pid);
-            if (handle == IntPtr.Zero) continue; // gone for good
+            if (handle == IntPtr.Zero)
+            {
+                if (Marshal.GetLastWin32Error() == ErrorAccessDenied)
+                {
+                    FileLogger.Write($"journal recovery: pid={e.pid} access denied (run elevated?) - entry KEPT for the next start");
+                    continue; // keep
+                }
+                remaining.Remove(e); // confirmed gone
+                continue;
+            }
             try
             {
-                if (!GetCreationFiletime(handle, out var created)) continue;
-                if (e.createdAt.HasValue && created != e.createdAt) continue; // pid reused by an innocent process
-                var snap = new ThrottleSnapshot(e.priorityClass, (IntPtr)e.affinity, e.ioPriority, e.createdAt, e.name);
-                if (ReleaseWith(e.pid, handle, snap) is null)
+                if (!GetCreationFiletime(handle, out var created) || (e.createdAt.HasValue && created != e.createdAt))
                 {
+                    remaining.Remove(e); // pid reused or identity unreadable: never write
+                    FileLogger.Write($"journal recovery: pid={e.pid} identity mismatch (reused pid) - entry dropped");
+                    continue;
+                }
+                var snap = new ThrottleSnapshot(e.priorityClass, (IntPtr)e.affinity, e.ioPriority, e.createdAt, e.name);
+                var err = RestoreProperties(handle, snap);
+                if (err is null)
+                {
+                    remaining.Remove(e);
                     restored++;
                 }
                 else
                 {
-                    // partial failure: keep the snapshot so a later manual
-                    // disable/exit can retry the restore
-                    lock (Gate)
-                    {
-                        Snapshots[e.pid] = snap;
-                        WriteJournalLocked();
-                    }
+                    FileLogger.Write($"journal recovery: pid={e.pid} partial failure ({err}) - entry KEPT for retry");
                 }
             }
             finally
@@ -121,7 +190,9 @@ public static class ProcessThrottle
                 CloseHandle(handle);
             }
         }
-        return (entries.Count, restored);
+
+        lock (Gate) WriteJournalEntriesLocked(remaining);
+        return (remaining.Count, restored, droppedInvalid);
     }
 
     private static string? Throttle(int pid, string name, IntPtr handle, IntPtr fullAffinityMask)
@@ -131,24 +202,43 @@ public static class ProcessThrottle
         {
             if (!Snapshots.TryGetValue(pid, out var existing))
             {
+                if (!_journalHealthy)
+                {
+                    return "journal unavailable - refusing to throttle (release would be unrecoverable); fix journal access and retry";
+                }
                 var prio = GetPriorityClass(handle);
                 if (prio == 0) return $"GetPriorityClass failed (err {Marshal.GetLastWin32Error()})";
                 if (!GetProcessAffinityMask(handle, out var affinity, out _)) return $"GetProcessAffinityMask failed (err {Marshal.GetLastWin32Error()})";
+                if (!GetCreationFiletime(handle, out var createdAt))
+                {
+                    // identity unknown: never throttle what we cannot later identify
+                    return "GetProcessTimes failed - cannot establish process identity, refusing to throttle";
+                }
                 if (prio == 0x40 /* Idle */ && affinity.ToInt64() == 1)
                 {
                     // already wearing our throttle fingerprint while we hold no
-                    // snapshot: an orphaned throttle from a crashed/lost
-                    // journal. The originals are unknowable - say so loudly
-                    // instead of silently snapshotting the polluted state.
+                    // snapshot: an orphaned throttle. The originals are
+                    // unknowable - say so loudly instead of silently
+                    // snapshotting the polluted state.
                     FileLogger.Write($"pid={pid} adopted in an already-throttled state (orphaned throttle, journal missing for it) - snapshot may not reflect the true originals");
                 }
-                GetCreationFiletime(handle, out var createdAt);
                 snap = new ThrottleSnapshot(prio, affinity, QueryIoPriority(handle), createdAt, name);
                 Snapshots[pid] = snap;
                 WriteJournalLocked();
             }
             else
             {
+                // pid reuse guard: the live process must still be the one we
+                // snapshotted, otherwise the old originals would be written
+                // onto an innocent process at release time
+                if (existing.CreatedAtFiletime.HasValue
+                    && (!GetCreationFiletime(handle, out var nowCreated) || nowCreated != existing.CreatedAtFiletime.Value))
+                {
+                    FileLogger.Write($"pid={pid} creation time mismatch (pid reused) - discarding stale snapshot");
+                    Snapshots.Remove(pid);
+                    WriteJournalLocked();
+                    return "pid was reused; stale snapshot discarded - retrying adoption on the next sample";
+                }
                 snap = existing;
             }
         }
@@ -175,15 +265,40 @@ public static class ProcessThrottle
 
     private static string? Release(int pid, IntPtr handle)
     {
+        ThrottleSnapshot snap;
         lock (Gate)
         {
-            if (!Snapshots.TryGetValue(pid, out var snap)) return null; // never throttled by us
-            return ReleaseWith(pid, handle, snap);
+            if (!Snapshots.TryGetValue(pid, out var existing)) return null; // never throttled by us
+            snap = existing;
         }
+        // pid reuse guard before writing anything
+        if (snap.CreatedAtFiletime.HasValue
+            && (!GetCreationFiletime(handle, out var created) || created != snap.CreatedAtFiletime.Value))
+        {
+            FileLogger.Write($"pid={pid} creation time mismatch at release (pid reused) - snapshot discarded, new process untouched");
+            Forget(pid);
+            return null; // the innocent process keeps its own state; treat as released
+        }
+        var err = RestoreProperties(handle, snap);
+        if (err is null)
+        {
+            lock (Gate)
+            {
+                Snapshots.Remove(pid);
+                WriteJournalLocked();
+            }
+            return null;
+        }
+        lock (Gate)
+        {
+            Snapshots[pid] = snap; // keep for retry
+            WriteJournalLocked();
+        }
+        return "partial restore failed: " + err + " (snapshot kept for retry)";
     }
 
-    /// <summary>Restores all three properties independently; snapshot survives partial failure.</summary>
-    private static string? ReleaseWith(int pid, IntPtr handle, ThrottleSnapshot snap)
+    /// <summary>Restores all three properties independently. Returns error text on partial failure.</summary>
+    private static string? RestoreProperties(IntPtr handle, ThrottleSnapshot snap)
     {
         var errors = new List<string>();
 
@@ -193,27 +308,14 @@ public static class ProcessThrottle
         if (snap.IoPriority.HasValue)
         {
             if (SetIoPriority(handle, snap.IoPriority.Value) is { } ioErr) errors.Add("io: " + ioErr);
+            else if (QueryIoPriority(handle) is { } q && q != snap.IoPriority.Value) errors.Add($"io readback mismatch (now {q}, want {snap.IoPriority.Value})");
         }
 
         if (!SetProcessAffinityMask(handle, snap.Affinity)) errors.Add($"affinity err {Marshal.GetLastWin32Error()}");
         else if (GetProcessAffinityMask(handle, out var affinityNow, out _) && affinityNow != snap.Affinity)
             errors.Add("affinity readback mismatch");
 
-        if (errors.Count > 0)
-        {
-            lock (Gate)
-            {
-                Snapshots[pid] = snap; // keep for retry
-                WriteJournalLocked();
-            }
-            return "partial restore failed: " + string.Join(", ", errors) + " (snapshot kept for retry)";
-        }
-        lock (Gate)
-        {
-            Snapshots.Remove(pid);
-            WriteJournalLocked();
-        }
-        return null;
+        return errors.Count == 0 ? null : string.Join(", ", errors);
     }
 
     /// <summary>Best-effort restore of everything Throttle may have applied.</summary>
@@ -231,49 +333,31 @@ public static class ProcessThrottle
             ? (IntPtr)(-1L) // all bits; (1L<<64) would shift to 1 and yield mask 0
             : (IntPtr)((1L << Environment.ProcessorCount) - 1);
 
-    // ---------------- journal ----------------
+    // ---------------- pid identity ----------------
 
-    private static void WriteJournalLocked()
+    /// <summary>True when the live process still matches the snapshotted identity.</summary>
+    private static bool CreationMatches(IntPtr handle, int pid, out string? reason)
     {
-        if (_journalPath is null) return;
-        try
+        ThrottleSnapshot snap;
+        lock (Gate)
         {
-            var file = new JournalFile(Snapshots.Select(kv =>
-            {
-                var s = kv.Value;
-                return new JournalEntry(kv.Key, s.Name, s.CreatedAtFiletime, s.PriorityClass, s.Affinity.ToInt64(), s.IoPriority);
-            }).ToList());
-            var tmp = _journalPath + ".tmp";
-            File.WriteAllText(tmp, JsonSerializer.Serialize(file));
-            File.Move(tmp, _journalPath, overwrite: true);
+            if (!Snapshots.TryGetValue(pid, out var existing)) { reason = null; return true; }
+            snap = existing;
         }
-        catch
+        if (!snap.CreatedAtFiletime.HasValue) { reason = null; return true; }
+        if (!GetCreationFiletime(handle, out var created) || created != snap.CreatedAtFiletime.Value)
         {
-            // journal failure must not break scheduling; recovery degrades to in-memory only
+            reason = $"pid={pid} creation time mismatch (pid reused)";
+            return false;
         }
+        reason = null;
+        return true;
     }
-
-    private static List<JournalEntry> ReadJournal()
-    {
-        try
-        {
-            if (_journalPath is null || !File.Exists(_journalPath)) return new List<JournalEntry>();
-            var file = JsonSerializer.Deserialize<JournalFile>(File.ReadAllText(_journalPath));
-            return file?.entries ?? new List<JournalEntry>();
-        }
-        catch
-        {
-            return new List<JournalEntry>(); // corrupt journal: treat as empty
-        }
-    }
-
-    // ---------------- process identity ----------------
 
     private static bool GetCreationFiletime(IntPtr handle, out long filetime)
     {
         // parameter order is creation, exit, kernel, USER - taking the fourth
-        // slot silently hands back CPU time, which changes every sample and
-        // made every startup recovery mismatch (0/N restored in field test)
+        // slot silently hands back CPU time, which changes every sample
         if (GetProcessTimes(handle, out var creation, out _, out _, out _)
             && (creation.dwLowDateTime != 0 || creation.dwHighDateTime != 0))
         {
@@ -283,6 +367,87 @@ public static class ProcessThrottle
         filetime = 0;
         return false;
     }
+
+    // ---------------- journal ----------------
+
+    private static void WriteJournalLocked()
+        => WriteJournalEntriesLocked(Snapshots.Select(kv =>
+            new JournalEntry(kv.Key, kv.Value.Name, kv.Value.CreatedAtFiletime, kv.Value.PriorityClass, kv.Value.Affinity.ToInt64(), kv.Value.IoPriority)).ToList());
+
+    private static void WriteJournalEntriesLocked(List<JournalEntry> entries)
+    {
+        if (_journalPath is null) return;
+        try
+        {
+            var tmp = _journalPath + ".tmp";
+            File.WriteAllText(tmp, JsonSerializer.Serialize(new JournalFile(entries)));
+            File.Move(tmp, _journalPath, overwrite: true);
+            _journalHealthy = true;
+        }
+        catch
+        {
+            _journalHealthy = false;
+            if (!_journalFailureLogged)
+            {
+                _journalFailureLogged = true;
+                FileLogger.Write("journal write failed - further throttles will be refused until the journal is writable (fail-closed)");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Read and validate the journal. Entries failing validation are dropped
+    /// and counted: the journal lives in a user-writable directory, so it is
+    /// untrusted input (review P0-A).
+    /// </summary>
+    private static (List<JournalEntry> entries, int dropped) ReadJournalValidated()
+    {
+        try
+        {
+            if (_journalPath is null || !File.Exists(_journalPath)) return (new List<JournalEntry>(), 0);
+            var fi = new FileInfo(_journalPath);
+            if (fi.Length > 64 * 1024)
+            {
+                FileLogger.Write($"journal oversized ({fi.Length}B) - treated as corrupt, ignored");
+                return (new List<JournalEntry>(), 0);
+            }
+            var file = JsonSerializer.Deserialize<JournalFile>(File.ReadAllText(_journalPath));
+            var raw = file?.entries ?? new List<JournalEntry>();
+            if (raw.Count > 64)
+            {
+                FileLogger.Write($"journal has too many entries ({raw.Count}) - treated as corrupt, ignored");
+                return (new List<JournalEntry>(), raw.Count);
+            }
+            GetProcessAffinityMask(GetCurrentProcess(), out _, out var systemMask);
+            var valid = new List<JournalEntry>();
+            var dropped = 0;
+            foreach (var e in raw)
+            {
+                var bad = e.pid <= 0
+                    || !e.createdAt.HasValue || e.createdAt.Value <= 0
+                    || !LegalPriorityClasses.Contains(e.priorityClass)
+                    || e.affinity == 0 || (e.affinity & ~systemMask.ToInt64()) != 0
+                    || (e.ioPriority.HasValue && (e.ioPriority.Value < 0 || e.ioPriority.Value > 4))
+                    || !TargetDiscovery.ScannerProcessNames.Contains(e.name, StringComparer.OrdinalIgnoreCase);
+                if (bad)
+                {
+                    dropped++;
+                    FileLogger.Write($"journal entry rejected (pid={e.pid}, name={e.name}, prio=0x{e.priorityClass:X}, createdAt={(e.createdAt?.ToString() ?? "null")}) - failed validation, dropped");
+                    continue;
+                }
+                valid.Add(e);
+            }
+            if (dropped > 0) FileLogger.Write($"journal validation: kept {valid.Count}, dropped {dropped} invalid entr{(dropped == 1 ? "y" : "ies")}");
+            return (valid, dropped);
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Write($"journal unreadable ({ex.Message}) - treated as empty; original left on disk");
+            return (new List<JournalEntry>(), 0);
+        }
+    }
+
+    // ---------------- raw properties ----------------
 
     private static int? QueryIoPriority(IntPtr handle)
     {
@@ -307,6 +472,9 @@ public static class ProcessThrottle
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetProcessTimes(IntPtr hProcess, out FileTime creation, out FileTime exit, out FileTime kernel, out FileTime user);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr GetCurrentProcess();
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, int processId);

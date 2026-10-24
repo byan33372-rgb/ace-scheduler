@@ -14,8 +14,6 @@ namespace MvxxcbRestrain;
 /// </summary>
 public static class IoSampler
 {
-    private static int _mode; // 0 = undecided, 1 = win32, 2 = wmi
-
     private const int ErrorAccessDenied = 5;
     private const int ErrorInvalidParameter = 87;
 
@@ -35,7 +33,6 @@ public static class IoSampler
             var fast = Win32ReadBytes(processId, out var fastErr);
             if (fast.HasValue)
             {
-                _mode = 1;
                 return fast.Value;
             }
             if (fastErr == ErrorAccessDenied) return WmiReadBytes(processId);
