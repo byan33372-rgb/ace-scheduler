@@ -321,8 +321,18 @@ void WorkerLoop()
             {
                 // the disable raced nothing: this runs after any in-flight
                 // tick, under the same lock, so a late re-throttle cannot
-                // survive; snapshots of unrecoverable targets stay journaled
-                lock (gate) DoReleaseAll();
+                // survive; snapshots of unrecoverable targets stay journaled.
+                // Release ONCE, then drop tracking - re-enabling re-adopts.
+                // Without the drop this loop re-released (and re-logged)
+                // every 500ms while disabled.
+                lock (gate)
+                {
+                    if (targets.Count > 0)
+                    {
+                        DoReleaseAll();
+                        targets.Clear();
+                    }
+                }
             }
             UpdateUiFromWorker();
         }
