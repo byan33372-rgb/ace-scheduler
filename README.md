@@ -74,7 +74,7 @@ IO 优先级是存储栈调度提示而非硬约束；对 SYSTEM 级或带受限
 - IO 优先级为调度提示，NVMe 队列不饱和时效果打折；CPU 优先级与亲和性作为兜底
 - 非提权进程无法观测/调度 SYSTEM 级目标（以日志与 UI 明示，非静默失败）
 - `BurstMBs`、`ProbeSeconds` 等参数暂为默认值，未提供运行时配置
-- 前台全屏判定使用 shell 官方 `SHQueryUserNotificationState`（`QUNS_BUSY`/`QUNS_PRESENTATION_MODE`）。此前按 `GetWindowRect` 与屏幕尺寸比较会把任何最大化窗口误判为全屏（DWM 隐形边框使矩形每边大约 8px），导致空闲放行状态几乎不可达，已弃用。该接口对无边框窗口化游戏的判定跟随 shell 启发式，个别窗口化运行的游戏可能不被判为全屏（此时按桌面空闲策略放行扫描）
+- 前台判定为混合信号：① 身份信号——前台窗口所属进程名命中用户可编辑的前台进程清单（`%LOCALAPPDATA%\mvxxcb-restrain\foreground-processes.txt`，每行一个进程名，支持 `#` 注释，修改保存后热生效）时视为前台忙；② 几何兜底——shell 官方 `SHQueryUserNotificationState`（`QUNS_BUSY`/`QUNS_PRESENTATION_MODE`）。身份信号与窗口模式、DPI、多显示器无关，覆盖 shell 不判为全屏的无边框窗口化程序；几何兜底保证清单为空时仍有全屏保护。弃用了 `GetWindowRect` 与屏幕尺寸比较的旧法：DWM 隐形边框使任何最大化窗口通过该判定，导致空闲放行状态几乎不可达。清单出厂为空，代码与文档不内置任何具体程序名
 
 ## 构建与运行
 

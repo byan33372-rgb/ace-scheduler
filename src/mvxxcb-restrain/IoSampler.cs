@@ -1,7 +1,7 @@
 using System.Management;
 using System.Runtime.InteropServices;
 
-namespace AceScheduler;
+namespace MvxxcbRestrain;
 
 /// <summary>
 /// Cumulative read-bytes sampler for one PID.

@@ -12,3 +12,7 @@ trial/phases.json
 trial/trial-report.json
 phases.json
 trial-report-cs.json
+
+# test artifacts stay local
+trial-report*.json
+test-matrix-results.json

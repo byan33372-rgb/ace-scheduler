@@ -1,5 +1,5 @@
 using System.Diagnostics;
-using AceScheduler;
+using MvxxcbRestrain;
 
 if (args.Length > 0 && args[0] == "--selftest")
 {
@@ -32,12 +32,32 @@ bool elevated = SessionMonitor.IsElevated();
 monitor.SetElevated(elevated);
 FileLogger.Write($"running elevated: {elevated}");
 
+// config directory + foreground identity list (user-editable, ships empty)
+var configDir = Path.Combine(
+    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+    "mvxxcb-restrain");
+var foregroundListPath = Path.Combine(configDir, "foreground-processes.txt");
+ForegroundMonitor.Configure(foregroundListPath);
+try
+{
+    Directory.CreateDirectory(configDir);
+    if (!File.Exists(foregroundListPath))
+    {
+        File.WriteAllText(foregroundListPath,
+            """
+            # 前台进程清单:每行一个进程名。这些进程位于前台时,扫描会被限速让路
+            # 可带或不带 .exe 后缀;修改保存后立即生效,无需重启
+            # 示例(去掉行首 # 生效):
+            # notepad.exe
+            """);
+    }
+}
+catch { }
+
 // persisted on/off state: the launcher remembers the user's last choice
 try
 {
-    var stateFile = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "mvxxcb-restrain", "enabled.txt");
+    var stateFile = Path.Combine(configDir, "enabled.txt");
     if (File.Exists(stateFile) && File.ReadAllText(stateFile).Trim() == "0") shared.Enabled = false;
 }
 catch { }
@@ -46,11 +66,8 @@ void PersistEnabled()
 {
     try
     {
-        var dir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "mvxxcb-restrain");
-        Directory.CreateDirectory(dir);
-        File.WriteAllText(Path.Combine(dir, "enabled.txt"), shared.Enabled ? "1" : "0");
+        Directory.CreateDirectory(configDir);
+        File.WriteAllText(Path.Combine(configDir, "enabled.txt"), shared.Enabled ? "1" : "0");
     }
     catch { }
 }
@@ -198,7 +215,7 @@ void WorkerLoop()
             var dt = (now - lastTick).TotalSeconds;
             lastTick = now;
 
-            var fg = ForegroundMonitor.IsFullscreenApp();
+            var fg = ForegroundMonitor.IsForegroundBusy();
             monitor.Foreground(fg, now);
             monitor.PollGames(now);
             monitor.TickCloseCheck(now);

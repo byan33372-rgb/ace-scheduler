@@ -1,4 +1,4 @@
-namespace AceScheduler;
+namespace MvxxcbRestrain;
 
 public enum SchedulerState
 {
@@ -28,9 +28,6 @@ public sealed class SchedulerOptions
     /// <summary>Quiet samples (rate below half the burst threshold) required to
     /// declare a scan ended from BurstIdle.</summary>
     public int QuietConfirmSamples { get; init; } = 2;
-
-    /// <summary>Force the foreground-busy signal on (overrides detection).</summary>
-    public bool AlwaysThrottle { get; init; }
 
     /// <summary>Seconds to wait before retrying a failed throttle attempt.</summary>
     public double RetryAfterFailSeconds { get; init; } = 5;
@@ -79,8 +76,6 @@ public sealed class SchedulerStateMachine
     /// <summary>Feed one cumulative-read-bytes observation plus the foreground-busy signal.</summary>
     public SampleResult OnSample(double cumulativeReadBytes, DateTimeOffset now, bool foregroundBusy)
     {
-        if (_options.AlwaysThrottle) foregroundBusy = true;
-
         if (_lastTs == default)
         {
             _lastTs = now;

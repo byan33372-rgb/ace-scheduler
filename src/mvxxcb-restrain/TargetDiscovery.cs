@@ -1,7 +1,6 @@
 using System.Diagnostics;
-using System.Management;
 
-namespace AceScheduler;
+namespace MvxxcbRestrain;
 
 /// <summary>
 /// ACE is identified by stable invariants, never a game list: service names
@@ -19,13 +18,6 @@ public static class TargetDiscovery
         "ACE-Service64",
     };
 
-    /// <summary>First running scanner process, or null when ACE is dormant.</summary>
-    public static Process? FindScanner()
-    {
-        var all = FindScanners();
-        return all.Count > 0 ? all[0] : null;
-    }
-
     /// <summary>All running scanner processes (ACE runs several at once).</summary>
     public static List<Process> FindScanners()
     {
@@ -40,24 +32,5 @@ public static class TargetDiscovery
             }
         }
         return found;
-    }
-
-    /// <summary>True while any AntiCheatExpert* service is registered (installed even when stopped).</summary>
-    public static bool AceServiceInstalled()
-    {
-        try
-        {
-            using var searcher = new ManagementObjectSearcher(
-                "SELECT Name FROM Win32_Service WHERE Name LIKE 'AntiCheatExpert%'");
-            foreach (var o in searcher.Get())
-            {
-                return true;
-            }
-        }
-        catch
-        {
-            // WMI unavailable - fall back to process discovery only
-        }
-        return false;
     }
 }

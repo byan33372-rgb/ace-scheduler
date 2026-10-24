@@ -1,6 +1,6 @@
 using System.Text;
 
-namespace AceScheduler;
+namespace MvxxcbRestrain;
 
 /// <summary>
 /// Release-safe file logger (Debug.WriteLine is compiled out of Release

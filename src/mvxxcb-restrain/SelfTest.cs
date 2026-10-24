@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Text.Json;
 
-namespace AceScheduler;
+namespace MvxxcbRestrain;
 
 /// <summary>
 /// Headless mode for sandbox validation (v0.3 release gate).
@@ -12,7 +12,7 @@ namespace AceScheduler;
 /// </summary>
 public static class SelfTest
 {
-    private sealed record Evt(string ts, string evt, string? state, double? mbps, string? action, int? pid);
+    private sealed record Evt(string ts, string evt, string? state, double? mbps, string? action, int? pid, bool? fgReal = null);
 
     private sealed class TargetCtx
     {
@@ -120,7 +120,11 @@ public static class SelfTest
                 }
                 ctx.NullStreak = 0;
                 var result = ctx.Engine.OnSample(bytes.Value, now, fgBusy);
-                Log(ctx.Proc.Id, new Evt(Utc(now), "sample", result.State.ToString(), result.RateMBps, null, ctx.Proc.Id));
+                // Exercise the REAL foreground sensor every tick so the sandbox
+                // covers ForegroundMonitor itself, not just the control-file
+                // simulation (external review: structural blind spot).
+                Log(ctx.Proc.Id, new Evt(Utc(now), "sample", result.State.ToString(), result.RateMBps, null, ctx.Proc.Id,
+                    ForegroundMonitor.IsForegroundBusy()));
             }
             foreach (var pid in gone)
             {

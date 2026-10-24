@@ -148,6 +148,8 @@ $c6ok = ($p5bi.Count -ge 1 -and $null -ne $ratio5 -and $ratio5 -gt 0.5)
 $checks.c6_idle_passthrough = @{ pass = $c6ok; detail = "BurstIdle samples in P5=$($p5bi.Count), passthrough events=$($p5pass.Count), P5 throughput=$m5 MB/s, ratio5=$ratio5 (expect >0.5)" }
 $c7ok = ($rc2Priority -eq 'Normal' -and $rc2Affinity -eq $fullMask)
 $checks.c7_final_restore    = @{ pass = $c7ok; detail = "P6 end: priority=$rc2Priority affinity=$rc2Affinity (full=$fullMask)" }
+$fgRealSamples = @($limLines | Where-Object { $_.evt -eq 'sample' -and $null -ne $_.fgReal })
+$checks.c9_foreground_real  = @{ pass = ($fgRealSamples.Count -ge 5); detail = "samples exercising the real ForegroundMonitor sensor=$($fgRealSamples.Count) (expect >=5; closes the sandbox blind spot)" }
 $allPass = $true
 foreach ($k in $checks.Keys) { if (-not $checks[$k].pass) { $allPass = $false } }
 $report = @{ allPass = $allPass; engine = 'csharp-v3'; checks = $checks; restore = @{ p3 = @{ priority = $rcPriority; affinity = $rcAffinity }; p6 = @{ priority = $rc2Priority; affinity = $rc2Affinity }; fullMask = $fullMask }; phaseMBs = @{ p1 = $m1; p2 = $m2; p4 = $m4; p5 = $m5 } }

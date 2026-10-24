@@ -2,7 +2,7 @@ using System.Management;
 using System.Security.Principal;
 using System.Text;
 
-namespace AceScheduler;
+namespace MvxxcbRestrain;
 
 /// <summary>
 /// Observes scanner sessions: scanner presence, per-sample rates (persisted

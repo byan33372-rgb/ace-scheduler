@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 
-namespace AceScheduler;
+namespace MvxxcbRestrain;
 
 public sealed record ThrottleSnapshot(uint PriorityClass, IntPtr Affinity, int? IoPriority);
 

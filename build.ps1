@@ -8,7 +8,7 @@ $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dotnet = @('D:\dev\dotnet\dotnet.exe', (Join-Path $env:LOCALAPPDATA 'Microsoft\dotnet\dotnet.exe')) | Where-Object { Test-Path $_ } | Select-Object -First 1
 if (-not $dotnet) { $dotnet = 'dotnet' }
 
-& $dotnet publish (Join-Path $repoRoot 'src\AceScheduler') `
+& $dotnet publish (Join-Path $repoRoot 'src\mvxxcb-restrain') `
   -c Release -r win-x64 --self-contained `
   -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
   -p:EnableCompressionInSingleFile=true `
