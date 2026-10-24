@@ -6,42 +6,32 @@ namespace AceScheduler;
 /// Production foreground signal: a fullscreen foreground window counts as
 /// "something to yield to". Deliberately conservative - it only gates WHEN
 /// throttling is applied, never touches the throttled process itself.
-/// v0.3 roadmap: extend with per-process foreground heuristics.
+/// Uses SHQueryUserNotificationState (the shell's own fullscreen verdict)
+/// because GetWindowRect vs screen bounds reports ANY maximized window as
+/// fullscreen: DWM invisible borders make the rect ~8px larger per side,
+/// which would keep foregroundBusy permanently true and make BurstIdle
+/// (idle passthrough) unreachable.
 /// </summary>
 public static class ForegroundMonitor
 {
-    [DllImport("user32.dll")]
-    private static extern IntPtr GetForegroundWindow();
+    private const int QunsBusy = 2;              // full-screen application running
+    private const int QunsPresentationMode = 4;  // user gave a presentation / do-not-disturb
 
-    [DllImport("user32.dll")]
-    private static extern bool GetWindowRect(IntPtr hWnd, out Rect rect);
+    [DllImport("shell32.dll")]
+    private static extern int SHQueryUserNotificationState(out int state);
 
-    [StructLayout(LayoutKind.Sequential)]
-    private struct Rect
-    {
-        public int Left;
-        public int Top;
-        public int Right;
-        public int Bottom;
-    }
-
-    /// <summary>True when the foreground window covers an entire screen.</summary>
+    /// <summary>True when the user is running a full-screen application.</summary>
     public static bool IsFullscreenApp()
     {
         try
         {
-            var hwnd = GetForegroundWindow();
-            if (hwnd == IntPtr.Zero) return false;
-            if (!GetWindowRect(hwnd, out var r)) return false;
-            var screen = System.Windows.Forms.Screen.PrimaryScreen;
-            if (screen is null) return false;
-            var w = r.Right - r.Left;
-            var h = r.Bottom - r.Top;
-            return w >= screen.Bounds.Width && h >= screen.Bounds.Height;
+            var hr = SHQueryUserNotificationState(out var state);
+            if (hr < 0) return false; // detection failure must never gate throttling on
+            return state == QunsBusy || state == QunsPresentationMode;
         }
         catch
         {
-            return false; // detection failure must never crash the loop
+            return false;
         }
     }
 }

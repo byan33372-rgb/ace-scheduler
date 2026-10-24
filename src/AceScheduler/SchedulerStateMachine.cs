@@ -133,14 +133,15 @@ public sealed class SchedulerStateMachine
 
             case SchedulerState.Throttled:
                 _throttledSeconds += dt;
-                if (_throttledSeconds >= _options.ProbeSeconds)
+                if (_throttledSeconds >= _options.ProbeSeconds && InBackoff(now) is false)
                 {
                     var restoreErr = _applyThrottle(false);
                     if (restoreErr != null)
                     {
                         LastError = restoreErr;
+                        _lastFailTs = now; // retry with backoff, not on every tick
                         _log(new SchedulerEvent(now, "restore-failed", mbps, restoreErr));
-                        // stay Throttled and retry on the next probe cycle
+                        // stay Throttled and retry after RetryAfterFailSeconds
                     }
                     else
                     {

@@ -19,7 +19,7 @@ var options = new SchedulerOptions();
 var fullMask = ProcessThrottle.FullAffinityMask();
 var gate = new object();                     // guards targets + shared reads
 var targets = new Dictionary<int, TargetEntry>();
-var goneAt = new Dictionary<int, DateTimeOffset>(); // re-adoption cooldown (anti-flap)
+var goneUntil = new Dictionary<int, DateTimeOffset>(); // re-adoption cooldown (anti-flap)
 var monitor = new SessionMonitor();
 var shared = new SharedState();
 NotifyIcon? notifyIcon = null;
@@ -64,12 +64,16 @@ void LogEvent(int pid, SchedulerEvent ev)
 
 const int NullStreakLimit = 10;      // ~5s of unreadable IO counters = gone
 const double ReadoptCooldownSec = 15; // same pid must stay gone this long before re-adoption
+const double DeniedCooldownSec = 600; // never successfully sampled = observation denied; long backoff
 
 /// <summary>
 /// Liveness is sampler-based: a target is dead only when its IO counters are
 /// unreadable for NullStreakLimit consecutive ticks. We never hold Process
 /// objects - Refresh()/HasExited throw access-denied for SYSTEM-owned scanner
 /// processes and previously caused 582 adopt/drop flaps per hour.
+/// A target that NEVER produced a readable sample is treated as
+/// observation-denied (e.g. non-elevated vs SYSTEM) and backs off for
+/// DeniedCooldownSec instead of cycling adopt/drop every ~20s forever.
 /// </summary>
 void RetargetIfNeeded(DateTimeOffset now)
 {
@@ -82,8 +86,16 @@ void RetargetIfNeeded(DateTimeOffset now)
         }
         foreach (var pid in dead)
         {
+            var everSampled = targets[pid].EverSampled;
             targets.Remove(pid);
-            goneAt[pid] = now;
+            // Drop any throttle snapshot we hold for this pid: the process is
+            // gone, restore is impossible, and a stale snapshot would pollute
+            // the next innocent process that reuses this pid.
+            if (ProcessThrottle.ForgetIfPresent(pid, out var wasThrottled) && wasThrottled)
+                FileLogger.Write($"pid={pid} died while throttled; snapshot dropped (restore impossible)");
+            goneUntil[pid] = now.AddSeconds(everSampled ? ReadoptCooldownSec : DeniedCooldownSec);
+            if (!everSampled)
+                FileLogger.Write($"pid={pid} was never observable (access denied?) - re-adoption backed off {DeniedCooldownSec:F0}s; run elevated to observe SYSTEM scanners");
             monitor.ScannerGone(pid, now);
         }
 
@@ -93,7 +105,7 @@ void RetargetIfNeeded(DateTimeOffset now)
             var name = proc.ProcessName;
             proc.Dispose(); // read what we need, drop the handle immediately
             if (targets.ContainsKey(pid)) continue;
-            if (goneAt.TryGetValue(pid, out var at) && (now - at).TotalSeconds < ReadoptCooldownSec) continue;
+            if (goneUntil.TryGetValue(pid, out var until) && now < until) continue;
 
             var entry = new TargetEntry { Pid = pid, Name = name };
             entry.Engine = new SchedulerStateMachine(
@@ -206,6 +218,7 @@ void WorkerLoop()
                             continue;
                         }
                         entry.NullStreak = 0;
+                        entry.EverSampled = true;
                         var result = entry.Engine.OnSample(bytes.Value, now, fg);
                         monitor.EngineSample(entry.Pid, result.RateMBps, result.State.ToString(), now, dt);
                     }
@@ -350,4 +363,5 @@ sealed class TargetEntry
     public required string Name;
     public SchedulerStateMachine Engine = null!;
     public int NullStreak;
+    public bool EverSampled; // false at death = observation-denied -> long re-adoption backoff
 }

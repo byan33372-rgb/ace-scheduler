@@ -16,36 +16,35 @@ public static class IoSampler
 {
     private static int _mode; // 0 = undecided, 1 = win32, 2 = wmi
 
+    private const int ErrorAccessDenied = 5;
+    private const int ErrorInvalidParameter = 87;
+
+    /// <summary>
+    /// Sampling verdict for one PID. The fast kernel32 path is ALWAYS probed:
+    /// its failure error classifies the target. ERROR_ACCESS_DENIED (5) means
+    /// alive but protected (SYSTEM) - the WMI value is authoritative there.
+    /// Any other failure (87 = pid gone) returns null immediately: WMI keeps
+    /// serving STALE rows for killed processes (observed ~2 minutes in field
+    /// tests), which made dead targets immortal and starved sampler-based
+    /// liveness.
+    /// </summary>
     public static double? GetCumulativeReadBytes(int processId)
     {
         try
         {
-            if (_mode == 0) Decide(processId);
-            return _mode switch
+            var fast = Win32ReadBytes(processId, out var fastErr);
+            if (fast.HasValue)
             {
-                1 => Win32ReadBytes(processId) ?? WmiReadBytes(processId),
-                _ => WmiReadBytes(processId),
-            };
+                _mode = 1;
+                return fast.Value;
+            }
+            if (fastErr == ErrorAccessDenied) return WmiReadBytes(processId);
+            return null; // process gone (or sampler broken): never trust stale WMI
         }
         catch
         {
             return null;
         }
-    }
-
-    private static void Decide(int processId)
-    {
-        var win32 = Win32ReadBytes(processId);
-        if (win32.HasValue)
-        {
-            _mode = 1;
-            return;
-        }
-        if (WmiReadBytes(processId).HasValue)
-        {
-            _mode = 2;
-        }
-        // both failed: target likely gone either way; stay undecided and retry
     }
 
     private static double? WmiReadBytes(int processId)
@@ -88,13 +87,31 @@ public static class IoSampler
     [DllImport("kernel32.dll")]
     private static extern bool CloseHandle(IntPtr hObject);
 
-    private static double? Win32ReadBytes(int processId)
+    private static double? Win32ReadBytes(int processId, out int win32Error)
     {
         var handle = OpenProcess(ProcessQueryLimitedInformation, false, processId);
-        if (handle == IntPtr.Zero) return null;
+        if (handle == IntPtr.Zero)
+        {
+            win32Error = Marshal.GetLastWin32Error();
+            return null;
+        }
         try
         {
-            if (!GetProcessIoCounters(handle, out var counters)) return null;
+            // A force-killed process whose object is still referenced (e.g. a
+            // parent holding a Process object) answers OpenProcess and serves
+            // FROZEN IO counters forever - rate alone cannot tell "dead" from
+            // "idle". The exit code can: anything but STILL_ACTIVE = zombie.
+            if (GetExitCodeProcess(handle, out var exit) && exit != StillActive)
+            {
+                win32Error = ErrorInvalidParameter;
+                return null;
+            }
+            if (!GetProcessIoCounters(handle, out var counters))
+            {
+                win32Error = Marshal.GetLastWin32Error();
+                return null;
+            }
+            win32Error = 0;
             return counters.ReadTransferCount;
         }
         finally
@@ -102,4 +119,9 @@ public static class IoSampler
             CloseHandle(handle);
         }
     }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetExitCodeProcess(IntPtr hProcess, out uint exitCode);
+
+    private const uint StillActive = 259;
 }

@@ -45,25 +45,56 @@ public static class ProcessThrottle
     /// <summary>Drop a stale snapshot after the target exits unthrottled-on-our-watch.</summary>
     public static void Forget(int processId) => Snapshots.Remove(processId);
 
+    /// <summary>Forget that also reports whether a snapshot existed (target died on our watch).</summary>
+    public static bool ForgetIfPresent(int processId, out bool wasThrottled)
+    {
+        wasThrottled = Snapshots.Remove(processId);
+        return true;
+    }
+
     private static string? Throttle(int pid, IntPtr handle, IntPtr fullAffinityMask)
     {
-        if (!Snapshots.ContainsKey(pid))
+        if (!Snapshots.TryGetValue(pid, out var snap))
         {
             var prio = GetPriorityClass(handle);
             if (prio == 0) return $"GetPriorityClass failed (err {Marshal.GetLastWin32Error()})";
             if (!GetProcessAffinityMask(handle, out var affinity, out _)) return $"GetProcessAffinityMask failed (err {Marshal.GetLastWin32Error()})";
-            Snapshots[pid] = new ThrottleSnapshot(prio, affinity, QueryIoPriority(handle));
+            snap = new ThrottleSnapshot(prio, affinity, QueryIoPriority(handle));
+            Snapshots[pid] = snap;
         }
 
         if (!SetPriorityClass(handle, 0x40 /* Idle */)) return $"SetPriorityClass Idle failed (err {Marshal.GetLastWin32Error()})";
         var ioErr = SetIoPriority(handle, 0 /* VeryLow */);
-        if (!SetProcessAffinityMask(handle, (IntPtr)1)) return $"SetProcessAffinityMask failed (err {Marshal.GetLastWin32Error()})";
+        if (!SetProcessAffinityMask(handle, (IntPtr)1))
+        {
+            // Partial failure: priority+IO are already applied and would stay
+            // applied forever (the engine never enters THROTTLED, so nothing
+            // releases them). Roll back to the snapshot before reporting.
+            var rb = Rollback(handle, snap);
+            return $"SetProcessAffinityMask failed (err {Marshal.GetLastWin32Error()})"
+                + (rb is null ? "; rolled back to pre-throttle state" : $"; ROLLBACK FAILED ({rb}) - priority may be stuck at Idle");
+        }
 
         // verify what we can read back
         var now = GetPriorityClass(handle);
         if (now == 0) return $"GetPriorityClass failed (err {Marshal.GetLastWin32Error()})";
-        if (now != 0x40) return $"verify failed: priority class readback 0x{now:X}, expected 0x40";
+        if (now != 0x40)
+        {
+            var rb = Rollback(handle, snap);
+            return $"verify failed: priority class readback 0x{now:X}, expected 0x40"
+                + (rb is null ? "; rolled back to pre-throttle state" : $"; ROLLBACK FAILED ({rb})");
+        }
         return ioErr; // null = IO priority applied too
+    }
+
+    /// <summary>Best-effort restore of everything Throttle may have applied. Null = fully restored.</summary>
+    private static string? Rollback(IntPtr handle, ThrottleSnapshot snap)
+    {
+        var errors = new List<string>();
+        if (!SetPriorityClass(handle, snap.PriorityClass)) errors.Add($"priority err {Marshal.GetLastWin32Error()}");
+        if (snap.IoPriority.HasValue && SetIoPriority(handle, snap.IoPriority.Value) is { } ioErr) errors.Add(ioErr);
+        if (!SetProcessAffinityMask(handle, snap.Affinity)) errors.Add($"affinity err {Marshal.GetLastWin32Error()}");
+        return errors.Count == 0 ? null : string.Join(", ", errors);
     }
 
     private static string? Release(int pid, IntPtr handle)

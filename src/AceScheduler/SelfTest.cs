@@ -20,6 +20,7 @@ public static class SelfTest
         public SchedulerStateMachine Engine = null!;
         public DateTimeOffset LastTs;
         public double LastBytes;
+        public int NullStreak; // sampler-based liveness, same rule as Program.cs
     }
 
     public static int Run(string[] args)
@@ -104,24 +105,20 @@ public static class SelfTest
             var gone = new List<int>();
             foreach (var ctx in targets.ToArray())
             {
-                try
+                // Liveness mirrors Program.cs: 10 consecutive unreadable IO
+                // counter ticks = gone. No Refresh()/HasExited - that pattern
+                // access-denies on protected processes and flaps.
+                var bytes = IoSampler.GetCumulativeReadBytes(ctx.Proc.Id);
+                if (bytes is null)
                 {
-                    ctx.Proc.Refresh();
-                    if (ctx.Proc.HasExited)
+                    if (++ctx.NullStreak >= 10)
                     {
                         Log(ctx.Proc.Id, new Evt(Utc(now), "target-gone", null, null, null, ctx.Proc.Id));
                         gone.Add(ctx.Proc.Id);
-                        continue;
                     }
-                }
-                catch
-                {
-                    gone.Add(ctx.Proc.Id);
                     continue;
                 }
-
-                var bytes = IoSampler.GetCumulativeReadBytes(ctx.Proc.Id);
-                if (bytes is null) continue;
+                ctx.NullStreak = 0;
                 var result = ctx.Engine.OnSample(bytes.Value, now, fgBusy);
                 Log(ctx.Proc.Id, new Evt(Utc(now), "sample", result.State.ToString(), result.RateMBps, null, ctx.Proc.Id));
             }
