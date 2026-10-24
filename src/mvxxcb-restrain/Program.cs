@@ -96,6 +96,16 @@ void RetargetIfNeeded(DateTimeOffset now)
 {
     lock (gate)
     {
+        // expired cooldowns leave; the dictionary must not grow forever with
+        // scanner pid churn (one game session can cycle dozens of pids)
+        if (goneUntil.Count > 0)
+        {
+            foreach (var stale in goneUntil.Where(kv => now >= kv.Value).Select(kv => kv.Key).ToList())
+            {
+                goneUntil.Remove(stale);
+            }
+        }
+
         var dead = new List<int>();
         foreach (var (pid, entry) in targets)
         {
@@ -206,6 +216,7 @@ void SetEnabled(bool enabled)
 void WorkerLoop()
 {
     var lastTick = DateTimeOffset.UtcNow;
+    var lastTrim = DateTimeOffset.UtcNow - MemoryMaintenance.TrimInterval; // first trim soon after startup
     while (true)
     {
         Thread.Sleep(500);
@@ -214,6 +225,18 @@ void WorkerLoop()
             var now = DateTimeOffset.UtcNow;
             var dt = (now - lastTick).TotalSeconds;
             lastTick = now;
+
+            // resident-process housekeeping: compact the heap and drop the
+            // working set back so a days-long tray session does not creep up
+            if (now - lastTrim >= MemoryMaintenance.TrimInterval)
+            {
+                var before = MemoryMaintenance.WorkingSetMB();
+                MemoryMaintenance.Trim();
+                var after = MemoryMaintenance.WorkingSetMB();
+                if (before >= 0 && after >= 0 && before - after >= 5)
+                    FileLogger.Write($"memory trimmed: working set {before}MB -> {after}MB");
+                lastTrim = now;
+            }
 
             var fg = ForegroundMonitor.IsForegroundBusy();
             monitor.Foreground(fg, now);

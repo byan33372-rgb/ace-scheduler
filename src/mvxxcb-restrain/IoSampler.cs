@@ -53,9 +53,15 @@ public static class IoSampler
         {
             using var searcher = new ManagementObjectSearcher(
                 "SELECT ReadTransferCount FROM Win32_Process WHERE ProcessId = " + processId);
-            foreach (var o in searcher.Get())
+            // the result collection and its COM-backed objects are IDisposable;
+            // leaking them on every tick accumulates native memory
+            using var results = searcher.Get();
+            foreach (ManagementObject o in results)
             {
-                return Convert.ToDouble(o["ReadTransferCount"]);
+                using (o)
+                {
+                    return Convert.ToDouble(o["ReadTransferCount"]);
+                }
             }
         }
         catch
