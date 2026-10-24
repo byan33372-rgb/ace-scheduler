@@ -200,7 +200,7 @@ public sealed class SessionMonitor
             changed = fullscreen != _fgFullscreen;
             _fgFullscreen = fullscreen;
         }
-        if (changed) Append(fullscreen ? "fg-fullscreen-enter" : "fg-fullscreen-exit", "");
+        if (changed) Append(fullscreen ? "fg-busy" : "fg-idle", "");
     }
 
     /// <summary>Poll annotated game executables; called every ~1s from the worker.</summary>
