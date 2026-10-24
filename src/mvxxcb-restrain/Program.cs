@@ -38,6 +38,8 @@ var configDir = Path.Combine(
     "mvxxcb-restrain");
 var foregroundListPath = Path.Combine(configDir, "foreground-processes.txt");
 ForegroundMonitor.Configure(foregroundListPath);
+SessionMonitor.ConfigureGames(Path.Combine(configDir, "games.txt"));
+ProcessThrottle.Configure(Path.Combine(configDir, "throttle-journal.json"));
 try
 {
     Directory.CreateDirectory(configDir);
@@ -51,6 +53,27 @@ try
             # notepad.exe
             """);
     }
+    var gamesListPath = Path.Combine(configDir, "games.txt");
+    if (!File.Exists(gamesListPath))
+    {
+        File.WriteAllText(gamesListPath,
+            """
+            # 游戏进程清单:每行一个游戏主程序进程名,用于会话监测把扫描活动与游戏时段对齐
+            # 可带或不带 .exe 后缀;修改保存后立即生效,无需重启
+            # 示例(去掉行首 # 生效):
+            # somegame
+            """);
+    }
+}
+catch { }
+try
+{
+    // crash recovery: restore anything the previous run left throttled.
+    // live pids with a matching creation time get their originals back;
+    // stale/reused entries are dropped silently.
+    var (attempted, restored) = ProcessThrottle.RecoverAtStartup();
+    if (attempted > 0)
+        FileLogger.Write($"startup journal recovery: {restored}/{attempted} target(s) restored from previous run");
 }
 catch { }
 
@@ -88,6 +111,11 @@ const double DeniedCooldownSec = 600; // never successfully sampled = observatio
 /// unreadable for NullStreakLimit consecutive ticks. We never hold Process
 /// objects - Refresh()/HasExited throw access-denied for SYSTEM-owned scanner
 /// processes and previously caused 582 adopt/drop flaps per hour.
+/// NullStreak alone is not trusted (external review P0-1): a transient WMI
+/// outage also produces nulls. At the limit we cross-check with
+/// Process.GetProcessById - a lightweight existence query that works for
+/// SYSTEM processes. Missing = dead (release first, then forget); still
+/// present = sampler outage, keep the target AND its throttle snapshot.
 /// A target that NEVER produced a readable sample is treated as
 /// observation-denied (e.g. non-elevated vs SYSTEM) and backs off for
 /// DeniedCooldownSec instead of cycling adopt/drop every ~20s forever.
@@ -109,17 +137,33 @@ void RetargetIfNeeded(DateTimeOffset now)
         var dead = new List<int>();
         foreach (var (pid, entry) in targets)
         {
-            if (entry.NullStreak >= NullStreakLimit) dead.Add(pid);
+            if (entry.NullStreak < NullStreakLimit) continue;
+            var alive = false;
+            try { _ = Process.GetProcessById(pid); alive = true; } catch (ArgumentException) { }
+            if (alive)
+            {
+                // sampler outage on a live target: keep target + snapshot,
+                // keep any throttle as-is; log at most once a minute
+                entry.NullStreak = 0;
+                if ((now - entry.LastObserveLostLog).TotalSeconds > 60)
+                {
+                    entry.LastObserveLostLog = now;
+                    FileLogger.Write($"pid={pid} samples lost but process is alive (sampler outage) - target and throttle state kept");
+                }
+                continue;
+            }
+            dead.Add(pid);
         }
         foreach (var pid in dead)
         {
             var everSampled = targets[pid].EverSampled;
+            var name = targets[pid].Name;
             targets.Remove(pid);
-            // Drop any throttle snapshot we hold for this pid: the process is
-            // gone, restore is impossible, and a stale snapshot would pollute
-            // the next innocent process that reuses this pid.
-            if (ProcessThrottle.ForgetIfPresent(pid, out var wasThrottled) && wasThrottled)
-                FileLogger.Write($"pid={pid} died while throttled; snapshot dropped (restore impossible)");
+            // try to restore before dropping: the process may still be in
+            // teardown where SetPriorityClass works; anything left over is
+            // unrecoverable, but the snapshot must never outlive the target
+            var err = ProcessThrottle.TryRecoverBeforeForget(pid, name, fullMask);
+            if (err is not null) FileLogger.Write($"pid={pid} final restore attempt: {err}");
             goneUntil[pid] = now.AddSeconds(everSampled ? ReadoptCooldownSec : DeniedCooldownSec);
             if (!everSampled)
                 FileLogger.Write($"pid={pid} was never observable (access denied?) - re-adoption backed off {DeniedCooldownSec:F0}s; run elevated to observe SYSTEM scanners");
@@ -137,7 +181,7 @@ void RetargetIfNeeded(DateTimeOffset now)
             var entry = new TargetEntry { Pid = pid, Name = name };
             entry.Engine = new SchedulerStateMachine(
                 options,
-                throttle => ProcessThrottle.Apply(pid, throttle, fullMask),
+                throttle => ProcessThrottle.Apply(pid, name, throttle, fullMask),
                 ev => LogEvent(pid, ev));
             targets[pid] = entry;
             monitor.ScannerFound(pid, name, now);
@@ -190,22 +234,31 @@ void ApplyUi((string Status, string Tooltip) s)
 
 void UpdateUiFromWorker() => RunOnUi(() => ApplyUi(StatusStrings()));
 
+/// <summary>
+/// Release every throttle we hold. Runs on the worker at the top of a tick
+/// after the user disabled scheduling (never inline on the UI thread: the
+/// UI click must not block on WMI-era locks, and ordering after any
+/// in-flight tick is exactly what kills the disable race).
+/// </summary>
+void DoReleaseAll()
+{
+    foreach (var pid in targets.Keys.ToList())
+    {
+        var name = targets[pid].Name;
+        var err = ProcessThrottle.Apply(pid, name, false, fullMask);
+        // keep the snapshot only when restore PARTIALLY failed - the journal
+        // then survives for retry/next-startup recovery. Full success removes
+        // it inside Apply.
+        FileLogger.Write(err is null ? $"released pid={pid}" : $"release pid={pid} failed: {err}");
+    }
+}
+
 void SetEnabled(bool enabled)
 {
-    lock (gate)
-    {
-        shared.Enabled = enabled;
-        if (!enabled)
-        {
-            // stop sampling AND release every throttle we currently hold
-            foreach (var pid in targets.Keys.ToList())
-            {
-                var err = ProcessThrottle.Apply(pid, false, fullMask);
-                ProcessThrottle.Forget(pid);
-                FileLogger.Write(err is null ? $"released pid={pid}" : $"release pid={pid} failed: {err}");
-            }
-        }
-    }
+    // flip the flag only; the worker performs the actual release on its next
+    // tick under the same lock that guards sampling - after any in-flight
+    // tick completes - so a late re-throttle cannot survive the disable
+    lock (gate) shared.Enabled = enabled;
     PersistEnabled();
     FileLogger.Write(enabled ? "scheduler enabled by user" : "scheduler disabled by user");
     monitor.Log("scheduler", enabled ? "enabled" : "disabled");
@@ -263,6 +316,13 @@ void WorkerLoop()
                         monitor.EngineSample(entry.Pid, result.RateMBps, result.State.ToString(), now, dt);
                     }
                 }
+            }
+            else
+            {
+                // the disable raced nothing: this runs after any in-flight
+                // tick, under the same lock, so a late re-throttle cannot
+                // survive; snapshots of unrecoverable targets stay journaled
+                lock (gate) DoReleaseAll();
             }
             UpdateUiFromWorker();
         }
@@ -377,7 +437,11 @@ menu.Items.Add("打开日志", null, (_, _) =>
 menu.Items.Add(new ToolStripSeparator());
 menu.Items.Add("退出", null, (_, _) =>
 {
-    SetEnabled(false); // restore everything we throttled before leaving
+    // synchronous release on exit: the worker may never get another tick.
+    // Anything that partially fails stays journaled and is recovered on the
+    // next startup.
+    lock (gate) shared.Enabled = false;
+    lock (gate) DoReleaseAll();
     monitor.ForceClose("app exit");
     notifyIcon.Visible = false;
     Application.Exit();
@@ -426,4 +490,5 @@ sealed class TargetEntry
     public SchedulerStateMachine Engine = null!;
     public int NullStreak;
     public bool EverSampled; // false at death = observation-denied -> long re-adoption backoff
+    public DateTimeOffset LastObserveLostLog = DateTimeOffset.MinValue; // rate-limits sampler-outage logs
 }

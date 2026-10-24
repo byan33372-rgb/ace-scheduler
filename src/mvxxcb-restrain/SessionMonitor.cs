@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Management;
 using System.Security.Principal;
 using System.Text;
@@ -48,7 +49,40 @@ public sealed class SessionMonitor
     private DateTimeOffset? _fgLastTick;
     private bool _elevated;
 
-    public static readonly string[] GameNames = { "VALORANT-Win64-Shipping", "Endfield" };
+    // Game process names live in a user-editable config file (one per line,
+    // '#' comments, hot-reloaded) - the code and docs ship without naming
+    // any specific game.
+    private static string? _gamesListPath;
+    private static string[] _gameNames = Array.Empty<string>();
+    private static DateTime _gamesStampUtc = DateTime.MinValue;
+
+    public static void ConfigureGames(string gamesListPath) => _gamesListPath = gamesListPath;
+
+    private static void RefreshGameNames()
+    {
+        if (_gamesListPath is null) return;
+        try
+        {
+            var stamp = File.GetLastWriteTimeUtc(_gamesListPath);
+            if (stamp == _gamesStampUtc) return;
+            _gamesStampUtc = stamp;
+            var names = new List<string>();
+            foreach (var raw in File.ReadAllLines(_gamesListPath))
+            {
+                var line = raw.Trim();
+                if (line.Length == 0 || line.StartsWith('#')) continue;
+                if (line.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) line = line[..^4];
+                if (line.Length > 0) names.Add(line);
+            }
+            _gameNames = names.ToArray();
+        }
+        catch
+        {
+            // unreadable list: keep the last successfully loaded names
+        }
+    }
+
+    public static IReadOnlyList<string> GameNames => _gameNames;
 
     public static bool IsElevated()
     {
@@ -206,10 +240,31 @@ public sealed class SessionMonitor
     /// <summary>Poll annotated game executables; called every ~1s from the worker.</summary>
     public void PollGames(DateTimeOffset now)
     {
-        foreach (var name in GameNames)
+        RefreshGameNames();
+        // a name dropped from the list while its process was tracked must
+        // still emit its exit event - otherwise the session timeline leaks
+        // a game-start that never ends
+        string[] dropped;
+        lock (_gate)
+        {
+            dropped = _gamesPresent.Where(n => !_gameNames.Contains(n, StringComparer.OrdinalIgnoreCase)).ToArray();
+        }
+        foreach (var n in dropped) GamePresence(n, false, now);
+        foreach (var name in _gameNames)
         {
             bool present;
-            try { present = System.Diagnostics.Process.GetProcessesByName(name).Length > 0; }
+            try
+            {
+                // GetProcessesByName hands out Process objects that own
+                // handles - dispose every one of them (leaking two per
+                // second accumulates over a long session)
+                present = false;
+                foreach (var p in Process.GetProcessesByName(name))
+                {
+                    present = true;
+                    p.Dispose();
+                }
+            }
             catch { continue; }
             GamePresence(name, present, now);
         }

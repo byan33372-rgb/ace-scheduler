@@ -69,7 +69,7 @@ public static class SelfTest
                 var ctx = new TargetCtx { Proc = proc };
                 ctx.Engine = new SchedulerStateMachine(
                     options,
-                    throttle => ProcessThrottle.Apply(ctx.Proc.Id, throttle, fullMask),
+                    throttle => ProcessThrottle.Apply(ctx.Proc.Id, ctx.Proc.ProcessName, throttle, fullMask),
                     ev =>
                     {
                         var kind = ev.Kind switch

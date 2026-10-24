@@ -100,9 +100,11 @@ public static class FeedbackExport
         added++;
 
         Add(Path.Combine(dir, "log.txt"), "support/log.txt");
-        Add(Path.Combine(dir, "log.txt.bak"), "support/log.txt.bak");
+        Add(Path.Combine(dir, "log.txt.1"), "support/log.txt.1"); // FileLogger's rotation target
+        Add(Path.Combine(dir, "log.txt.bak"), "support/log.txt.bak"); // legacy manual backups, if any
         Add(Path.Combine(dir, "enabled.txt"), "support/enabled.txt");
         Add(Path.Combine(dir, "foreground-processes.txt"), "support/foreground-processes.txt");
+        Add(Path.Combine(dir, "games.txt"), "support/games.txt");
 
         foreach (var f in sessionFiles.Where(f => f != primary).Take(5))
         {

@@ -117,6 +117,7 @@ public sealed class SchedulerStateMachine
                         _state = SchedulerState.Idle;
                         _burstRun = 0;
                         _quietRun = 0;
+                        LastError = null; // scan ended cleanly - stale errors no longer apply
                         _log(new SchedulerEvent(now, "release", mbps, "scan ended (never throttled)"));
                     }
                 }
@@ -159,6 +160,7 @@ public sealed class SchedulerStateMachine
                     {
                         _state = SchedulerState.BurstIdle;
                         _burstRun = 0;
+                        LastError = null; // released via passthrough - clear stale errors
                         _log(new SchedulerEvent(now, "passthrough", mbps, "probe: still scanning, desktop idle - released"));
                     }
                 }
