@@ -6,25 +6,34 @@ if (args.Length > 0 && args[0] == "--selftest")
     return SelfTest.Run(args);
 }
 
+// --- single instance: a second launch only activates the first one's panel ---
+using var single = new Mutex(true, "mvxxcb-restrain-single-instance", out bool firstInstance);
+if (!firstInstance)
+{
+    try { EventWaitHandle.OpenExisting("mvxxcb-restrain-activate").Set(); } catch { }
+    return 0;
+}
+using var activateSignal = new EventWaitHandle(false, EventResetMode.AutoReset, "mvxxcb-restrain-activate");
+
 var options = new SchedulerOptions();
 var fullMask = ProcessThrottle.FullAffinityMask();
+var gate = new object();                     // guards targets + shared reads
 var targets = new Dictionary<int, TargetEntry>();
 var monitor = new SessionMonitor();
+var shared = new SharedState();
 NotifyIcon? notifyIcon = null;
 Form? panel = null;
-int _tickCount = 0;
 Label statusLabel = null!;
 Button toggleButton = null!;
-System.Windows.Forms.Timer? timer = null;
+ToolStripMenuItem toggleItem = null!;
 
 // persisted on/off state: the launcher remembers the user's last choice
-bool schedulerEnabled = true;
 try
 {
     var stateFile = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "mvxxcb-restrain", "enabled.txt");
-    if (File.Exists(stateFile) && File.ReadAllText(stateFile).Trim() == "0") schedulerEnabled = false;
+    if (File.Exists(stateFile) && File.ReadAllText(stateFile).Trim() == "0") shared.Enabled = false;
 }
 catch { }
 
@@ -36,7 +45,7 @@ void PersistEnabled()
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "mvxxcb-restrain");
         Directory.CreateDirectory(dir);
-        File.WriteAllText(Path.Combine(dir, "enabled.txt"), schedulerEnabled ? "1" : "0");
+        File.WriteAllText(Path.Combine(dir, "enabled.txt"), shared.Enabled ? "1" : "0");
     }
     catch { }
 }
@@ -44,118 +53,159 @@ void PersistEnabled()
 void LogEvent(int pid, SchedulerEvent ev)
 {
     var line = $"pid={pid} {ev.Kind} {ev.RateMBps:F0}MB/s {ev.Detail}";
-    Debug.WriteLine($"[{ev.Timestamp:HH:mm:ss}] {line}");
     FileLogger.Write(line);
     monitor.EngineEvent(pid, ev.Kind, ev.Detail);
 }
 
 void RetargetIfNeeded()
 {
-    var dead = new List<int>();
-    foreach (var (pid, entry) in targets)
+    lock (gate)
     {
-        try
+        var dead = new List<int>();
+        foreach (var (pid, entry) in targets)
         {
-            entry.Proc.Refresh();
-            if (entry.Proc.HasExited) dead.Add(pid);
+            try
+            {
+                entry.Proc.Refresh();
+                if (entry.Proc.HasExited) dead.Add(pid);
+            }
+            catch { dead.Add(pid); }
         }
-        catch { dead.Add(pid); }
-    }
-    foreach (var pid in dead)
-    {
-        targets[pid].Dispose();
-        ProcessThrottle.Forget(pid);
-        targets.Remove(pid);
-        monitor.ScannerGone(pid, DateTimeOffset.UtcNow);
-    }
-
-    foreach (var proc in TargetDiscovery.FindScanners())
-    {
-        if (targets.ContainsKey(proc.Id))
+        foreach (var pid in dead)
         {
-            proc.Dispose();
-            continue;
+            targets[pid].Dispose();
+            ProcessThrottle.Forget(pid);
+            targets.Remove(pid);
+            monitor.ScannerGone(pid, DateTimeOffset.UtcNow);
         }
-        IoSampler.GetCumulativeReadBytes(proc.Id); // prime the sampler
-        var engine = new SchedulerStateMachine(
-            options,
-            throttle => ProcessThrottle.Apply(proc.Id, throttle, fullMask),
-            ev => LogEvent(proc.Id, ev));
-        targets[proc.Id] = new TargetEntry { Proc = proc, Engine = engine };
-        monitor.ScannerFound(proc.Id, proc.ProcessName, DateTimeOffset.UtcNow);
-        FileLogger.Write($"target adopted: pid={proc.Id}");
+
+        foreach (var proc in TargetDiscovery.FindScanners())
+        {
+            if (targets.ContainsKey(proc.Id))
+            {
+                proc.Dispose();
+                continue;
+            }
+            IoSampler.GetCumulativeReadBytes(proc.Id); // prime the sampler
+            var engine = new SchedulerStateMachine(
+                options,
+                throttle => ProcessThrottle.Apply(proc.Id, throttle, fullMask),
+                ev => LogEvent(proc.Id, ev));
+            targets[proc.Id] = new TargetEntry { Proc = proc, Engine = engine };
+            monitor.ScannerFound(proc.Id, proc.ProcessName, DateTimeOffset.UtcNow);
+            FileLogger.Write($"target adopted: pid={proc.Id}");
+        }
     }
 }
 
-string StatusText()
+(string Status, string Tooltip) StatusStrings()
 {
-    if (!schedulerEnabled) return "当前状态：已停用（不干预任何进程）";
-    if (targets.Count == 0) return "当前状态：运行中，未发现扫描进程";
-    var err = targets.Values.FirstOrDefault(t => t.Engine.LastError is not null)?.Engine.LastError;
-    if (err is not null) return $"当前状态：限速失败（{err}）";
-    return $"当前状态：调度中，目标进程 {targets.Count} 个";
-}
-
-void RefreshUi()
-{
-    var tooltip = schedulerEnabled
-        ? "mvxxcb-restrain | " + StatusText()[5..]
-        : "mvxxcb-restrain | 已停用";
-    if (tooltip.Length > 63) tooltip = tooltip[..63];
-    if (notifyIcon is not null && notifyIcon.Text != tooltip) notifyIcon.Text = tooltip;
-    if (panel is not null)
+    int count; string? err;
+    lock (gate)
     {
-        statusLabel.Text = StatusText();
-        toggleButton.Text = schedulerEnabled ? "停用（OFF）" : "启用（ON）";
+        count = targets.Count;
+        err = targets.Values.FirstOrDefault(t => t.Engine.LastError is not null)?.Engine.LastError;
     }
+    if (!shared.Enabled) return ("当前状态：已停用（不干预任何进程）", "mvxxcb-restrain | 已停用");
+    if (count == 0) return ("当前状态：运行中，未发现扫描进程", "mvxxcb-restrain | 运行中，未发现扫描进程");
+    if (err is not null)
+    {
+        var s = $"当前状态：限速失败（{err}）";
+        return (s, Trim63("mvxxcb-restrain | " + s[5..]));
+    }
+    var t = $"当前状态：调度中，目标进程 {count} 个";
+    return (t, "mvxxcb-restrain | " + t[5..]);
 }
+
+static string Trim63(string s) => s.Length > 63 ? s[..63] : s;
+
+/// <summary>Marshal UI updates onto the UI thread; safe no-op during shutdown.</summary>
+void RunOnUi(Action action)
+{
+    try
+    {
+        if (panel is null || !panel.IsHandleCreated || panel.IsDisposed) return;
+        if (panel.InvokeRequired) panel.BeginInvoke(action);
+        else action();
+    }
+    catch { /* UI gone - shutting down */ }
+}
+
+void ApplyUi((string Status, string Tooltip) s)
+{
+    notifyIcon!.Text = Trim63(s.Tooltip);
+    statusLabel.Text = s.Status;
+    toggleButton.Text = shared.Enabled ? "停用（OFF）" : "启用（ON）";
+    toggleItem.Text = shared.Enabled ? "停用调度" : "启用调度";
+}
+
+void UpdateUiFromWorker() => RunOnUi(() => ApplyUi(StatusStrings()));
 
 void SetEnabled(bool enabled)
 {
-    schedulerEnabled = enabled;
+    lock (gate)
+    {
+        shared.Enabled = enabled;
+        if (!enabled)
+        {
+            // stop sampling AND release every throttle we currently hold
+            foreach (var pid in targets.Keys.ToList())
+            {
+                var err = ProcessThrottle.Apply(pid, false, fullMask);
+                ProcessThrottle.Forget(pid);
+                FileLogger.Write(err is null ? $"released pid={pid}" : $"release pid={pid} failed: {err}");
+            }
+        }
+    }
     PersistEnabled();
     FileLogger.Write(enabled ? "scheduler enabled by user" : "scheduler disabled by user");
     monitor.Log("scheduler", enabled ? "enabled" : "disabled");
-    if (!enabled)
-    {
-        // stop sampling AND release every throttle we currently hold
-        timer?.Stop();
-        foreach (var pid in targets.Keys.ToList())
-        {
-            var err = ProcessThrottle.Apply(pid, false, fullMask);
-            ProcessThrottle.Forget(pid);
-            FileLogger.Write(err is null ? $"released pid={pid}" : $"release pid={pid} failed: {err}");
-        }
-    }
-    else
-    {
-        timer?.Start();
-    }
-    RefreshUi();
+    ApplyUi(StatusStrings()); // caller is on the UI thread
 }
 
-void Tick(object? sender, EventArgs e)
+// ---------------- background worker: all discovery/sampling off the UI thread ----------------
+int tick = 0;
+void WorkerLoop()
 {
-    RetargetIfNeeded();
-    _tickCount++;
-    if (_tickCount % 2 == 0) monitor.PollGames(DateTimeOffset.UtcNow);
-    monitor.TickCloseCheck(DateTimeOffset.UtcNow);
-    if (targets.Count == 0) { RefreshUi(); return; }
-    var fg = ForegroundMonitor.IsFullscreenApp();
-    var now = DateTimeOffset.UtcNow;
-    foreach (var entry in targets.Values)
+    while (true)
     {
-        var bytes = IoSampler.GetCumulativeReadBytes(entry.Proc.Id);
-        if (bytes.HasValue)
+        Thread.Sleep(500);
+        try
         {
-            var result = entry.Engine.OnSample(bytes.Value, now, fg);
-            monitor.EngineSample(entry.Proc.Id, result.RateMBps, result.State.ToString(), now);
+            var now = DateTimeOffset.UtcNow;
+            monitor.PollGames(now);
+            monitor.TickCloseCheck(now);
+            if (shared.Enabled)
+            {
+                RetargetIfNeeded();
+                tick++;
+                if (targets.Count > 0)
+                {
+                    var fg = ForegroundMonitor.IsFullscreenApp();
+                    lock (gate)
+                    {
+                        foreach (var entry in targets.Values)
+                        {
+                            var bytes = IoSampler.GetCumulativeReadBytes(entry.Proc.Id);
+                            if (bytes.HasValue)
+                            {
+                                var result = entry.Engine.OnSample(bytes.Value, now, fg);
+                                monitor.EngineSample(entry.Proc.Id, result.RateMBps, result.State.ToString(), now);
+                            }
+                        }
+                    }
+                }
+            }
+            UpdateUiFromWorker();
+        }
+        catch (Exception ex)
+        {
+            FileLogger.Write("worker error: " + ex.Message);
         }
     }
-    RefreshUi();
 }
 
-
+// ---------------- UI ----------------
 System.Drawing.Icon trayImage = SystemIcons.Shield;
 try
 {
@@ -176,7 +226,7 @@ panel = new Form
 };
 statusLabel = new Label
 {
-    Text = StatusText(),
+    Text = "当前状态：…",
     AutoSize = false,
     TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
     Location = new System.Drawing.Point(16, 20),
@@ -184,11 +234,11 @@ statusLabel = new Label
 };
 toggleButton = new Button
 {
-    Text = schedulerEnabled ? "停用（OFF）" : "启用（ON）",
+    Text = "…",
     Location = new System.Drawing.Point(16, 75),
     Size = new System.Drawing.Size(328, 45),
 };
-toggleButton.Click += (_, _) => SetEnabled(!schedulerEnabled);
+toggleButton.Click += (_, _) => SetEnabled(!shared.Enabled);
 panel.Controls.Add(statusLabel);
 panel.Controls.Add(toggleButton);
 panel.FormClosing += (_, e) =>
@@ -200,13 +250,12 @@ panel.FormClosing += (_, e) =>
         panel.Hide();
     }
 };
+_ = panel.Handle; // force handle creation now so worker marshaling works immediately
 
 var menu = new ContextMenuStrip();
 menu.Items.Add("打开控制面板", null, (_, _) => { panel.Show(); panel.Activate(); });
-var toggleItem = new ToolStripMenuItem();
-void SyncToggleItem() => toggleItem.Text = schedulerEnabled ? "停用调度" : "启用调度";
-toggleItem.Click += (_, _) => { SetEnabled(!schedulerEnabled); SyncToggleItem(); };
-SyncToggleItem();
+toggleItem = new ToolStripMenuItem("…");
+toggleItem.Click += (_, _) => SetEnabled(!shared.Enabled);
 menu.Items.Add(toggleItem);
 menu.Items.Add(new ToolStripSeparator());
 menu.Items.Add("打开监测报告", null, (_, _) =>
@@ -246,13 +295,29 @@ notifyIcon.DoubleClick += (_, _) => { panel.Show(); panel.Activate(); };
 
 Application.ApplicationExit += (_, _) => { notifyIcon.Dispose(); panel.Dispose(); };
 
-timer = new System.Windows.Forms.Timer { Interval = 500 };
-timer.Tick += Tick;
-if (schedulerEnabled) timer.Start();
+// second-instance activation: show the panel on demand
+var activator = new Thread(() =>
+{
+    while (true)
+    {
+        activateSignal.WaitOne();
+        RunOnUi(() => { panel.Show(); panel.Activate(); });
+    }
+})
+{ IsBackground = true, Name = "activate-waiter" };
+activator.Start();
 
-RefreshUi();
+var worker = new Thread(WorkerLoop) { IsBackground = true, Name = "scheduler-worker" };
+worker.Start();
+
+ApplyUi(StatusStrings());
 Application.Run();
 return 0;
+
+sealed class SharedState
+{
+    public volatile bool Enabled = true;
+}
 
 sealed class TargetEntry : IDisposable
 {
