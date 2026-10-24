@@ -312,12 +312,34 @@ toggleButton = new Button
 {
     Text = "…",
     Location = new System.Drawing.Point(16, 88),
-    Size = new System.Drawing.Size(328, 45),
+    Size = new System.Drawing.Size(218, 45),
 };
 toggleButton.Click += (_, _) => SetEnabled(!shared.Enabled);
+var feedbackButton = new Button
+{
+    Text = "反馈数据",
+    Location = new System.Drawing.Point(242, 88),
+    Size = new System.Drawing.Size(102, 45),
+};
+feedbackButton.Click += (_, _) =>
+{
+    try
+    {
+        var zip = FeedbackExport.Build();
+        FileLogger.Write("feedback bundle created: " + zip);
+        MessageBox.Show(panel, "已打包到桌面：\n" + zip, "反馈数据",
+            MessageBoxButtons.OK, MessageBoxIcon.Information);
+    }
+    catch (Exception ex)
+    {
+        MessageBox.Show(panel, "打包失败：" + ex.Message, "反馈数据",
+            MessageBoxButtons.OK, MessageBoxIcon.Error);
+    }
+};
 panel.Controls.Add(statusLabel);
 panel.Controls.Add(elevLabel);
 panel.Controls.Add(toggleButton);
+panel.Controls.Add(feedbackButton);
 panel.FormClosing += (_, e) =>
 {
     // closing the window hides it; the app keeps running in the tray
