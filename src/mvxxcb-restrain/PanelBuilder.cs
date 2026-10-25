@@ -194,8 +194,10 @@ internal static class PanelBuilder
         var headerLine = new Label
         {
             BackColor = UiTheme.Line,
-            Location = new Point(1, 40 + grid.ColumnHeadersHeight),
-            Size = new Size(S(390), 1),
+            // anchor to the grid's runtime geometry — raw constants are unscaled
+            // and put this line mid-header instead of under it
+            Location = new Point(grid.Left, grid.Top + grid.ColumnHeadersHeight),
+            Size = new Size(grid.Width, 1),
         };
         logPanel.Controls.Add(headerLine);
         logPanel.Controls.Add(logTitle);
