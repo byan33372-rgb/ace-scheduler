@@ -2,47 +2,34 @@ using System.Runtime.InteropServices;
 
 namespace MvxxcbRestrain;
 
-/// <summary>Dark "tech accelerator" theme for the control panel: colors, rounded
-/// drawing helpers, DWM dark title bar, and the themed controls used by Program.cs.</summary>
+/// <summary>
+/// Design tokens for the orthogonal "调度控制台" panel: deep navy surfaces,
+/// 1px hairlines, rectangular components, restrained accents. Geometry rules:
+/// 0px radius everywhere, horizontal/vertical lines only, 4px spacing grid.
+/// </summary>
 internal static class UiTheme
 {
-    // palette: unified dark tokens from the UI review report (slate base + cyan primary action)
-    public static readonly Color Window = Color.FromArgb(0x11, 0x18, 0x27);      // main background
-    public static readonly Color Card = Color.FromArgb(0x1F, 0x29, 0x37);        // content surface
-    public static readonly Color CardBorder = Color.FromArgb(0x37, 0x41, 0x51);  // dividers / weak stroke
-    public static readonly Color PrimaryText = Color.FromArgb(0xF3, 0xF4, 0xF6);
-    public static readonly Color DimText = Color.FromArgb(0x9C, 0xA3, 0xAF);
-    public static readonly Color Accent = Color.FromArgb(0x08, 0x91, 0xB2);      // primary interactions only
-    public static readonly Color AccentDark = Color.FromArgb(0x0B, 0x5E, 0x73);  // dark companion fill for accent (button base/hover)
-    public static readonly Color Success = Color.FromArgb(0x34, 0xD3, 0x99);     // 成功/授权——只表达真实成功状态
-    public static readonly Color Warn = Color.FromArgb(0xFF, 0x9F, 0x43);        // not elevated (out of report scope)
-    public static readonly Color Danger = Color.FromArgb(0xFB, 0x71, 0x85);      // disabled state
-    public static readonly Color DangerDark = Color.FromArgb(0x4A, 0x1F, 0x2B);
-    public static readonly Color Button2 = Color.FromArgb(0x1F, 0x29, 0x37);     // secondary button surface
-    public static readonly Color Button2Hover = Color.FromArgb(0x26, 0x32, 0x43);
+    // palette (design spec tokens)
+    public static readonly Color Window = Color.FromArgb(0x0B, 0x12, 0x20);      // --app-bg
+    public static readonly Color Card = Color.FromArgb(0x10, 0x1C, 0x2F);        // --panel-bg
+    public static readonly Color Surface = Color.FromArgb(0x14, 0x22, 0x38);     // --surface-bg
+    public static readonly Color Line = Color.FromArgb(0x29, 0x41, 0x5B);        // --line-color
+    public static readonly Color PrimaryText = Color.FromArgb(0xE8, 0xF0, 0xFA); // --text-primary
+    public static readonly Color DimText = Color.FromArgb(0x91, 0xA5, 0xBF);     // --text-secondary
+    public static readonly Color Accent = Color.FromArgb(0x24, 0x77, 0xEE);      // --primary (main op only)
+    public static readonly Color AccentHover = Color.FromArgb(0x3D, 0x86, 0xF0);
+    public static readonly Color Success = Color.FromArgb(0x18, 0xCF, 0xA0);     // --success
+    public static readonly Color Danger = Color.FromArgb(0xF4, 0x5A, 0x70);      // --danger
 
-    // type ladder from the review report: Head ~18.7px, Ui/UiBold 14px, Small 12px
+    public static readonly Font Head = new("Microsoft YaHei UI", 13F, FontStyle.Bold);
     public static readonly Font Ui = new("Microsoft YaHei UI", 10.5F);
     public static readonly Font UiBold = new("Microsoft YaHei UI", 10.5F, FontStyle.Bold);
-    public static readonly Font Head = new("Microsoft YaHei UI", 14F, FontStyle.Bold);
     public static readonly Font Small = new("Microsoft YaHei UI", 9F);
-
-    public static System.Drawing.Drawing2D.GraphicsPath Rounded(Rectangle r, int rad)
-    {
-        var p = new System.Drawing.Drawing2D.GraphicsPath();
-        int d = rad * 2;
-        p.AddArc(r.X, r.Y, d, d, 180, 90);
-        p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
-        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
-        p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
-        p.CloseFigure();
-        return p;
-    }
 
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
 
-    /// <summary>Dark immersive title bar (attribute 19 on 1809, 20 on 19041+).</summary>
+    /// <summary>Dark native title bar (attribute 20 on 19041+, 19 on 1809).</summary>
     public static void TryDarkTitleBar(IntPtr hwnd)
     {
         int on = 1;
@@ -51,28 +38,27 @@ internal static class UiTheme
     }
 }
 
-/// <summary>A rounded card panel that paints its own fill and 1px border.</summary>
-internal sealed class RoundedCard : Panel
+/// <summary>Flat rectangular panel: panel-bg fill + 1px line border, square corners.</summary>
+internal sealed class FlatPanel : Panel
 {
-    public RoundedCard()
+    public FlatPanel()
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-        BackColor = UiTheme.Card; // match the painted fill so child labels blend in
+        BackColor = UiTheme.Card;
     }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         var r = new Rectangle(0, 0, Width - 1, Height - 1);
-        using var path = UiTheme.Rounded(r, 12);
         using var fill = new SolidBrush(UiTheme.Card);
-        using var border = new Pen(UiTheme.CardBorder);
-        e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-        e.Graphics.FillPath(fill, path);
-        e.Graphics.DrawPath(border, path);
+        using var border = new Pen(UiTheme.Line);
+        e.Graphics.FillRectangle(fill, r);
+        e.Graphics.DrawRectangle(border, r);
     }
 }
 
-/// <summary>Status dot with a soft halo; breathes while the scheduler runs.</summary>
+/// <summary>Small round status marker — the one allowed circular element
+/// (state marker), always paired with a text label.</summary>
 internal sealed class StatusDot : Control
 {
     private System.Windows.Forms.Timer? _pulse;
@@ -81,13 +67,12 @@ internal sealed class StatusDot : Control
     public StatusDot()
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer, true);
-        Size = new Size(18, 18);
+        Size = new Size(14, 14);
         Color = UiTheme.DimText;
     }
 
     public Color Color { get; set; }
 
-    /// <summary>Start/stop the breathing animation (animate only while running).</summary>
     public void SetRunning(bool running)
     {
         if (running && _pulse is null)
@@ -110,12 +95,11 @@ internal sealed class StatusDot : Control
     {
         var g = e.Graphics;
         g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-        var core = new Rectangle(4, 4, 10, 10);
-        float halo = _pulse is null ? 0.25f : 0.12f + 0.10f * (float)Math.Sin(_phase);
+        float halo = _pulse is null ? 0.22f : 0.12f + 0.09f * (float)Math.Sin(_phase);
         using (var h = new SolidBrush(Color.FromArgb((int)(halo * 255), Color)))
-            g.FillEllipse(h, 0, 0, 18, 18);
+            g.FillEllipse(h, 0, 0, 14, 14);
         using var b = new SolidBrush(Color);
-        g.FillEllipse(b, core);
+        g.FillEllipse(b, 3, 3, 8, 8);
     }
 
     protected override void OnHandleDestroyed(EventArgs e)
@@ -125,17 +109,17 @@ internal sealed class StatusDot : Control
     }
 }
 
-/// <summary>Flat rounded button with hover states. Accent decides the palette;
-/// <see cref="ThemedButton.RefreshState"/> re-derives colors for the enabled/disabled scheduler look.</summary>
-internal sealed class ThemedButton : Button
+/// <summary>Rectangular flat button, 0px radius. Primary = solid accent;
+/// Secondary = surface bg + 1px accent border. Hover/pressed states included.</summary>
+internal sealed class FlatButton : Button
 {
     public enum Kind { Primary, Secondary }
 
-    private Kind _kind = Kind.Secondary;
+    private Kind _kind = Kind.Primary;
     private bool _hover;
-    private bool _schedulerEnabled = true;
+    private bool _down;
 
-    public ThemedButton()
+    public FlatButton()
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.UserPaint, true);
         FlatStyle = FlatStyle.Flat;
@@ -144,7 +128,9 @@ internal sealed class ThemedButton : Button
         BackColor = Color.Transparent;
         Cursor = Cursors.Hand;
         MouseEnter += (_, _) => { _hover = true; Invalidate(); };
-        MouseLeave += (_, _) => { _hover = false; Invalidate(); };
+        MouseLeave += (_, _) => { _hover = false; _down = false; Invalidate(); };
+        MouseDown += (_, _) => { _down = true; Invalidate(); };
+        MouseUp += (_, _) => { _down = false; Invalidate(); };
     }
 
     public Kind ButtonKind
@@ -153,47 +139,31 @@ internal sealed class ThemedButton : Button
         set { _kind = value; Invalidate(); }
     }
 
-    /// <summary>For Primary: color follows the scheduler on/off state.</summary>
-    public void RefreshState(bool schedulerEnabled)
-    {
-        _schedulerEnabled = schedulerEnabled;
-        Invalidate();
-    }
-
     protected override void OnPaint(PaintEventArgs e)
     {
         var g = e.Graphics;
-        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-        var r = new Rectangle(0, 0, Width - 1, Height - 1);
+        var r = new Rectangle(0, 0, Width, Height);
         Color fill, edge, text;
 
-        if (_kind == Kind.Secondary)
+        if (_kind == Kind.Primary)
         {
-            fill = _hover ? UiTheme.Button2Hover : UiTheme.Button2;
-            edge = UiTheme.CardBorder;
+            fill = _hover || _down ? UiTheme.AccentHover : UiTheme.Accent;
+            edge = fill;
             text = UiTheme.PrimaryText;
-        }
-        else if (_schedulerEnabled)
-        {
-            // live: mint-tinted, hover brightens toward the accent
-            fill = _hover ? Color.FromArgb(0x12, 0x3A, 0x33) : UiTheme.AccentDark;
-            edge = UiTheme.Accent;
-            text = UiTheme.Accent;
         }
         else
         {
-            fill = _hover ? Color.FromArgb(0x40, 0x1B, 0x28) : UiTheme.DangerDark;
-            edge = UiTheme.Danger;
-            text = UiTheme.Danger;
+            fill = _hover ? UiTheme.Surface : UiTheme.Card;
+            edge = UiTheme.Accent;
+            text = UiTheme.PrimaryText;
         }
 
-        using var path = UiTheme.Rounded(r, 10);
         using var f = new SolidBrush(fill);
+        g.FillRectangle(f, r);
         using var p = new Pen(edge);
-        g.FillPath(f, path);
-        g.DrawPath(p, path);
+        g.DrawRectangle(p, 0, 0, Width - 1, Height - 1);
 
-        TextRenderer.DrawText(g, Text, Font, r with { X = 1, Y = 1 }, text,
+        TextRenderer.DrawText(g, Text, Font, r, text,
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
     }
 }

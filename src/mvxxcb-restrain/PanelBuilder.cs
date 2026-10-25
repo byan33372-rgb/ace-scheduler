@@ -1,151 +1,235 @@
-using ReaLTaiizor.Forms;
-using ReaLTaiizor.Controls;
-using ReaLTaiizor.Colors;
+using System.Text.Json;
 
 namespace MvxxcbRestrain;
 
 /// <summary>
-/// Builds the control panel on ReaLTaiizor's Material dark theme following the
-/// UI review layout: 20px window padding, 16px card padding, solid primary and
-/// quiet secondary actions. Real Form subclass (minimize/tray flow intact),
-/// DPI-aware scaling handled at the entry point.
+/// Builds the "调度控制台" panel: orthogonal grid, deep navy surfaces, 1px
+/// hairlines, rectangular buttons. Native title bar (DWM dark) supplies the
+/// window controls — no second chrome. Business state flows in through
+/// Program.cs's ApplyUi; the log table reads real session JSONL events only.
 /// </summary>
 internal static class PanelBuilder
 {
     public sealed class Result
     {
-        public required MaterialForm Form { get; init; }
+        public required Form Form { get; init; }
         public required Label StatusLabel { get; init; }
         public required Label HeadLabel { get; init; }
         public required StatusDot HeadDot { get; init; }
-        public required CyberButton ToggleButton { get; init; }
-        public required CyberButton FeedbackButton { get; init; }
+        public required Label PermValue { get; init; }
+        public required FlatButton ToggleButton { get; init; }
+        public required FlatButton FeedbackButton { get; init; }
+        public required DataGridView LogGrid { get; init; }
     }
 
-    public static Result Build(bool elevated, Action toggleClicked, Action feedbackClicked)
+    private static readonly (string Evt, string Label, string Kind)[] EventMap =
     {
-        var form = new MaterialForm
-        {
-            Text = "mvxxcb-restrain 控制面板",
-            FormBorderStyle = FormBorderStyle.FixedSingle,
-            Sizable = false,                  // MaterialForm draws its own chrome and
-                                              // ignores FixedSingle unless told explicitly
-            FormStyle = ReaLTaiizor.Enum.Material.FormStyles.ActionBar_48,
-            MaximizeBox = false,
-            MinimizeBox = true,               // minimize to taskbar
-            StartPosition = FormStartPosition.CenterScreen,
-            ClientSize = new Size(432, 292),  // 20px side padding; 292 fits the 44px action row + footer
-            ShowInTaskbar = true,             // reachable while minimized
-        };
-        var skin = form.SkinManager;
-        skin.Theme = ReaLTaiizor.Manager.MaterialSkinManager.Themes.DARK;
-        skin.ColorScheme = new MaterialColorScheme(
-            Color.FromArgb(0x15, 0x1F, 0x2E),   // primary: deep navy title bar
-            Color.FromArgb(0x0E, 0x15, 0x23),   // dark primary
-            UiTheme.Accent,                      // light primary: mint accent line
-            UiTheme.Accent,                      // accent
-            UiTheme.PrimaryText);                // text shade
+        ("session-start",      "会话开始",     "info"),
+        ("scanner-found",      "发现扫描进程", "info"),
+        ("scanner-gone",       "扫描进程退出", "info"),
+        ("scheduler-throttle", "限速施加",     "good"),
+        ("scheduler-probe",    "探测窗口",     "info"),
+        ("scheduler-release",  "解除并恢复",   "good"),
+        ("observe-denied",     "观测被拒",     "bad"),
+        ("game-start",         "游戏启动",     "info"),
+        ("game-exit",          "游戏退出",     "info"),
+        ("session-summary",    "会话报告",     "info"),
+    };
 
-        // 20px window padding; the ActionBar_48 title bar takes 48px, card stays at y=56.
-        var statusCard = new RoundedCard { Location = new Point(20, 56), Size = new Size(392, 78) };
-        // 16px card padding: dot at cardX+16, text column starts at cardX+16+dotWidth (dot = 18px).
-        var headDot = new StatusDot { Location = new Point(16, 20) };
+    public static Result Build(bool elevated, Action toggleClicked, Action feedbackClicked, Action openLogs)
+    {
+        var form = new Form
+        {
+            Text = "调度控制台 · mvxxcb-restrain",
+            FormBorderStyle = FormBorderStyle.FixedSingle,
+            MaximizeBox = false,
+            MinimizeBox = true,
+            StartPosition = FormStartPosition.CenterScreen,
+            ShowInTaskbar = true,
+            BackColor = UiTheme.Window,
+            Font = UiTheme.Ui,
+        };
+        form.Shown += (_, _) => UiTheme.TryDarkTitleBar(form.Handle);
+
+        // layout constants are authored at 96 DPI; scale deterministically.
+        // AutoScaleMode stays None so WinForms never double-scales.
+        float k = form.DeviceDpi / 96f;
+        int S(int v) => (int)MathF.Round(v * k); // size
+        Point P(int x, int y) => new(S(x), S(y)); // position
+        Size Z(int w, int h) => new(S(w), S(h)); // extent
+        form.ClientSize = Z(432, 444);
+
+        // ---- status & permission panel: two columns split by a 1px vertical line ----
+        var statusPanel = new FlatPanel { Location = P(20, 16), Size = Z(392, 88) };
+
+        var headDot = new StatusDot { Location = P(16, 24), Size = Z(14, 14) };
         var headLabel = new Label
         {
-            Text = "…",                       // ApplyUi overwrites immediately; no preset status wording
-            AutoSize = false,
+            Text = "…",
+            AutoSize = true,
             Font = UiTheme.Head,
             ForeColor = UiTheme.PrimaryText,
-            Location = new Point(34, 12),
-            Size = new Size(342, 26),
+            Location = P(42, 14),
         };
         var statusLabel = new Label
         {
-            Text = "当前状态：…",
+            Text = "…",
             AutoSize = false,
+            AutoEllipsis = true,
             Font = UiTheme.Ui,
             ForeColor = UiTheme.DimText,
-            Location = new Point(34, 44),
-            Size = new Size(342, 24),
-            AutoEllipsis = true,              // review P0: long status lines ellipsize instead of clipping
+            Location = P(42, 48),
+            Size = Z(186, 24),
         };
-        statusCard.Controls.Add(headDot);
-        statusCard.Controls.Add(headLabel);
-        statusCard.Controls.Add(statusLabel);
-
-        // 徽章语义（评审整改）：已提权 = 授权成功 → Success；未提权保持 Warn 提示观测受限。
-        // 自绘胶囊与 AutoWidth 逻辑保持不变。
-        var badgeText = elevated ? "●  运行权限：已提权" : "●  运行权限：普通（未提权，观测可能受限）";
-        var badgeW = TextRenderer.MeasureText(badgeText, UiTheme.Small).Width + 24;
-        var badge = new System.Windows.Forms.Panel
+        var permTitle = new Label
         {
-            Location = new Point(20, 146),
-            Size = new Size(badgeW, 26),
-            BackColor = Color.Transparent,
+            Text = "运行权限",
+            AutoSize = false,
+            Font = UiTheme.Small,
+            ForeColor = UiTheme.DimText,
+            Location = P(254, 18),
+            Size = Z(122, 20),
         };
-        badge.Paint += (_, e) =>
+        var permValue = new Label
         {
-            var r = new Rectangle(0, 0, badge.Width - 1, badge.Height - 1);
-            var (border, text) = elevated ? (UiTheme.Success, UiTheme.Success) : (UiTheme.Warn, UiTheme.Warn);
-            var fill = elevated ? Color.FromArgb(0x26, UiTheme.Success) : Color.FromArgb(0x33, 0x25, 0x18);
-            using var path = UiTheme.Rounded(r, 13);
-            using var f = new SolidBrush(fill);
-            using var p = new Pen(border);
-            e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            e.Graphics.FillPath(f, path);
-            e.Graphics.DrawPath(p, path);
-            TextRenderer.DrawText(e.Graphics, badgeText,
-                UiTheme.Small, r with { X = 1, Y = 1 }, text,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            Text = elevated ? "已提权" : "未提权（观测受限）",
+            AutoSize = false,
+            AutoEllipsis = true,
+            Font = UiTheme.UiBold,
+            ForeColor = elevated ? UiTheme.Success : UiTheme.Danger,
+            Location = P(254, 42),
+            Size = Z(122, 26),
         };
 
-        // 主操作（评审规格）：实心样式 — Accent 底色 + 同色描边（实心无对比描边），高 44、圆角 8。
-        // 文案（"启用调度"/"停用调度"）与状态配色由 Program.cs 的 ApplyUi 动态设置，这里只定样式。
-        var toggle = new CyberButton
+        statusPanel.Controls.Add(headDot);
+        statusPanel.Controls.Add(headLabel);
+        statusPanel.Controls.Add(statusLabel);
+        statusPanel.Controls.Add(permTitle);
+        statusPanel.Controls.Add(permValue);
+        statusPanel.Paint += (_, e) =>
         {
-            TextButton = "…",
-            Size = new Size(212, 44),
-            Location = new Point(20, 184),
-            ColorBackground = UiTheme.Accent,
-            ColorBackground_Pen = UiTheme.Accent,
-            Rounding = true,
-            RoundingInt = 8,
-            Lighting = false,
+            // single vertical hairline splitting status | permission columns
+            e.Graphics.DrawLine(new Pen(UiTheme.Line), S(234), S(12), S(234), statusPanel.Height - S(12));
+        };
+
+        // ---- actions: equal-height rectangles, primary solid / secondary outlined ----
+        var toggle = new FlatButton
+        {
+            Text = "…",
+            ButtonKind = FlatButton.Kind.Primary,
+            Location = P(20, 120),
+            Size = Z(190, 44),
         };
         toggle.Click += (_, _) => toggleClicked();
 
-        // 次级操作（评审规格）：安静样式 — Card 底色 + 1px CardBorder 低对比描边，高 44、圆角 8；
-        // 与主按钮间距 14px，右缘对齐 20px 窗口内边距。
-        var feedback = new CyberButton
+        var feedback = new FlatButton
         {
-            TextButton = "反馈数据",
-            Size = new Size(166, 44),
-            Location = new Point(246, 184),
-            ColorBackground = UiTheme.Card,
-            ColorBackground_Pen = UiTheme.CardBorder,
-            Rounding = true,
-            RoundingInt = 8,
-            Lighting = false,
+            Text = "反馈数据",
+            ButtonKind = FlatButton.Kind.Secondary,
+            Location = P(222, 120),
+            Size = Z(190, 44),
         };
         feedback.Click += (_, _) => feedbackClicked();
 
-        var footer = new Label
-        {
-            Text = $"v{typeof(PanelBuilder).Assembly.GetName().Version?.ToString(3)} · 仅本地调度 · 明细见日志",
-            AutoSize = false,
-            Font = UiTheme.Small,
-            ForeColor = Color.FromArgb(0x59, 0x67, 0x80),
-            BackColor = Color.Transparent,
-            Location = new Point(20, 260),    // 12px above the bottom edge
-            Size = new Size(392, 20),
-            TextAlign = ContentAlignment.MiddleLeft,
-        };
+        // ---- run log: real session events, horizontal hairlines, internal scroll ----
+        var logPanel = new FlatPanel { Location = P(20, 180), Size = Z(392, 200) };
 
-        form.Controls.Add(statusCard);
-        form.Controls.Add(badge);
+        var logTitle = new Label
+        {
+            Text = "运行日志",
+            AutoSize = true,
+            Font = UiTheme.UiBold,
+            ForeColor = UiTheme.PrimaryText,
+            Location = P(16, 12),
+        };
+        var logOpen = new LinkLabel
+        {
+            Text = "查看全部",
+            AutoSize = true,
+            Font = UiTheme.Small,
+            LinkColor = UiTheme.DimText,
+            ActiveLinkColor = UiTheme.Accent,
+            Location = P(318, 14),
+        };
+        logOpen.Click += (_, _) => openLogs();
+
+        var grid = new DataGridView
+        {
+            Location = P(1, 40),
+            Size = Z(390, 158),
+            BorderStyle = BorderStyle.None,
+            BackgroundColor = UiTheme.Card,
+            GridColor = UiTheme.Line,
+            EnableHeadersVisualStyles = false,
+            RowHeadersVisible = false,
+            ReadOnly = true,
+            AllowUserToAddRows = false,
+            AllowUserToDeleteRows = false,
+            AllowUserToResizeRows = false,
+            MultiSelect = false,
+            SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+            CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal, // horizontal lines only
+            ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.Single,
+            ScrollBars = ScrollBars.Vertical,
+            Font = UiTheme.Small,
+            RowTemplate = { Height = S(30) },
+        };
+        grid.ColumnHeadersDefaultCellStyle.BackColor = UiTheme.Card;
+        grid.ColumnHeadersDefaultCellStyle.ForeColor = UiTheme.DimText;
+        grid.ColumnHeadersDefaultCellStyle.SelectionBackColor = UiTheme.Card;
+        grid.ColumnHeadersHeight = S(32);
+        grid.ColumnHeadersDefaultCellStyle.Padding = new Padding(S(8), 0, 0, 0);
+        grid.DefaultCellStyle.BackColor = UiTheme.Card;
+        grid.DefaultCellStyle.ForeColor = UiTheme.PrimaryText;
+        grid.DefaultCellStyle.SelectionBackColor = UiTheme.Surface;
+        grid.DefaultCellStyle.SelectionForeColor = UiTheme.PrimaryText;
+        grid.DefaultCellStyle.Padding = new Padding(S(8), 0, 0, 0);
+
+        var cTime = new DataGridViewTextBoxColumn { Name = "时间", Width = S(92), SortMode = DataGridViewColumnSortMode.NotSortable };
+        var cEvent = new DataGridViewTextBoxColumn { Name = "事件", Width = S(118), SortMode = DataGridViewColumnSortMode.NotSortable };
+        var cState = new DataGridViewTextBoxColumn { Name = "状态", Width = S(84), SortMode = DataGridViewColumnSortMode.NotSortable };
+        var cDetail = new DataGridViewTextBoxColumn { Name = "详情", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, SortMode = DataGridViewColumnSortMode.NotSortable };
+        grid.Columns.AddRange(cTime, cEvent, cState, cDetail);
+
+        logPanel.Controls.Add(logTitle);
+        logPanel.Controls.Add(logOpen);
+        logPanel.Controls.Add(grid);
+
+        // ---- footer: real version + log entry, split by a hairline ----
+        var footerLine = new Label
+        {
+            BackColor = UiTheme.Line,
+            Location = P(20, 396),
+            Size = Z(392, 1),
+        };
+        var version = new Label
+        {
+            Text = $"版本 v{typeof(PanelBuilder).Assembly.GetName().Version?.ToString(3)}",
+            AutoSize = true,
+            Font = UiTheme.Small,
+            ForeColor = UiTheme.DimText,
+            Location = P(20, 410),
+        };
+        var footerRight = new LinkLabel
+        {
+            Text = "本地调度 · 明细日志",
+            AutoSize = true,
+            Font = UiTheme.Small,
+            LinkColor = UiTheme.DimText,
+            ActiveLinkColor = UiTheme.Accent,
+            Location = P(290, 410),
+        };
+        footerRight.Click += (_, _) => openLogs();
+
+        form.Controls.Add(statusPanel);
         form.Controls.Add(toggle);
         form.Controls.Add(feedback);
-        form.Controls.Add(footer);
+        form.Controls.Add(logPanel);
+        form.Controls.Add(footerLine);
+        form.Controls.Add(version);
+        form.Controls.Add(footerRight);
+
+        RefreshLog(grid);
 
         return new Result
         {
@@ -153,8 +237,79 @@ internal static class PanelBuilder
             StatusLabel = statusLabel,
             HeadLabel = headLabel,
             HeadDot = headDot,
+            PermValue = permValue,
             ToggleButton = toggle,
             FeedbackButton = feedback,
+            LogGrid = grid,
         };
+    }
+
+    /// <summary>
+    /// Loads the newest real session JSONL into the grid. No invented rows:
+    /// with no session data the table shows a single empty-state row.
+    /// </summary>
+    public static void RefreshLog(DataGridView grid)
+    {
+        try
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "mvxxcb-restrain", "sessions");
+            if (!Directory.Exists(dir)) return;
+            var newest = Directory.GetFiles(dir, "session-*.jsonl")
+                .Select(f => new FileInfo(f))
+                .OrderByDescending(f => f.Name)
+                .FirstOrDefault();
+            if (newest is null) return;
+
+            var rows = new List<(string Time, string Evt, string State, string StateKind, string Detail)>();
+            foreach (var line in File.ReadLines(newest.FullName))
+            {
+                if (rows.Count >= 200) break;
+                JsonDocument doc;
+                try { doc = JsonDocument.Parse(line); }
+                catch { continue; }
+                using (doc)
+                {
+                    var evt = doc.RootElement.GetProperty("evt").GetString();
+                    if (evt is "rate" or "fg-busy" or "fg-idle") continue; // per-sample noise
+                    var ts = doc.RootElement.GetProperty("ts").GetString();
+                    var detail = doc.RootElement.TryGetProperty("detail", out var d) ? d.GetString() : "";
+                    var map = EventMap.FirstOrDefault(m => m.Evt == evt);
+                    var label = map.Evt is null ? evt : map.Label;
+                    var kind = map.Evt is null ? "info" : map.Kind;
+                    rows.Add((ts?.Length >= 19 ? ts[11..19] : ts ?? "", label,
+                        kind switch { "good" => "成功", "bad" => "警示", _ => "提示" },
+                        kind, detail ?? ""));
+                }
+            }
+
+            grid.SuspendLayout();
+            grid.Rows.Clear();
+            if (rows.Count == 0)
+            {
+                grid.Rows.Add("—", "暂无运行记录", "—", "调度事件将在此显示");
+                grid.Rows[0].DefaultCellStyle.ForeColor = UiTheme.DimText;
+            }
+            else
+            {
+                foreach (var r in rows.AsEnumerable().Reverse())
+                {
+                    var i = grid.Rows.Add(r.Time, r.Evt, r.State, r.Detail);
+                    var cell = grid.Rows[i].Cells[2];
+                    cell.Style.ForeColor = r.StateKind switch
+                    {
+                        "good" => UiTheme.Success,
+                        "bad" => UiTheme.Danger,
+                        _ => UiTheme.DimText,
+                    };
+                }
+            }
+            grid.ResumeLayout();
+        }
+        catch
+        {
+            // log is auxiliary; never break the panel over a read hiccup
+        }
     }
 }

@@ -31,8 +31,8 @@ Form? panel = null;
 Label statusLabel = null!;
 Label headLabel = null!;
 StatusDot headDot = null!;
-ReaLTaiizor.Controls.CyberButton toggleButton = null!;
-ReaLTaiizor.Controls.CyberButton feedbackButton = null!;
+FlatButton toggleButton = null!;
+FlatButton feedbackButton = null!;
 ToolStripMenuItem toggleItem = null!;
 
 bool elevated = SessionMonitor.IsElevated();
@@ -230,7 +230,7 @@ void RetargetIfNeeded(DateTimeOffset now)
         err = targets.Values.FirstOrDefault(t => t.Engine.LastError is not null)?.Engine.LastError;
     }
     var elevTag = elevated ? "" : " | 未提权";
-    if (!shared.Enabled) return ("已停用：不观测、不限制任何进程", "mvxxcb-restrain | 已停用" + elevTag);
+    if (!shared.Enabled) return ("已停用：不干预任何进程", "mvxxcb-restrain | 已停用" + elevTag);
     if (count == 0) return ("未发现扫描进程，磁盘空闲", "mvxxcb-restrain | 未发现扫描进程，磁盘空闲" + elevTag);
     if (err is not null)
     {
@@ -262,9 +262,7 @@ void ApplyUi((string Status, string Tooltip) s)
     headDot.Color = shared.Enabled ? UiTheme.Success : UiTheme.Danger;
     headDot.SetRunning(shared.Enabled);
     statusLabel.Text = s.Status;
-    toggleButton.TextButton = shared.Enabled ? "停用调度" : "启用调度";
-    toggleButton.ColorBackground = shared.Enabled ? UiTheme.Danger : UiTheme.Accent;
-    toggleButton.ColorBackground_Pen = shared.Enabled ? UiTheme.Danger : UiTheme.Accent;
+    toggleButton.Text = shared.Enabled ? "停用调度" : "启用调度";
     toggleItem.Text = shared.Enabled ? "停用调度" : "启用调度";
 }
 
@@ -424,6 +422,18 @@ var built = PanelBuilder.Build(elevated,
             MessageBox.Show(panel, "打包失败：" + ex.Message, "反馈数据",
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
+    },
+    openLogs: () =>
+    {
+        try
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "mvxxcb-restrain", "sessions");
+            Directory.CreateDirectory(dir);
+            Process.Start(new ProcessStartInfo(dir) { UseShellExecute = true });
+        }
+        catch { }
     });
 panel = built.Form;
 statusLabel = built.StatusLabel;
@@ -441,6 +451,15 @@ panel.FormClosing += (_, e) =>
     }
 };
 _ = panel.Handle; // force handle creation now so worker marshaling works immediately
+UiTheme.TryDarkTitleBar(panel.Handle); // apply before first possible show (Shown is too late for the preview path)
+
+// run-log feed: poll the newest session file while the panel is visible
+var logTimer = new System.Windows.Forms.Timer { Interval = 3000 };
+logTimer.Tick += (_, _) =>
+{
+    if (panel.Visible) PanelBuilder.RefreshLog(built.LogGrid);
+};
+logTimer.Start();
 
 var menu = new ContextMenuStrip
 {
