@@ -79,7 +79,7 @@ internal static class PanelBuilder
             Font = UiTheme.Ui,
             ForeColor = UiTheme.DimText,
             Location = P(42, 48),
-            Size = Z(186, 24),
+            Size = Z(172, 24),
         };
         var permTitle = new Label
         {
@@ -87,7 +87,7 @@ internal static class PanelBuilder
             AutoSize = false,
             Font = UiTheme.Small,
             ForeColor = UiTheme.DimText,
-            Location = P(254, 18),
+            Location = P(252, 16),
             Size = Z(122, 20),
         };
         var permValue = new Label
@@ -97,7 +97,7 @@ internal static class PanelBuilder
             AutoEllipsis = true,
             Font = UiTheme.UiBold,
             ForeColor = elevated ? UiTheme.Success : UiTheme.Danger,
-            Location = P(254, 42),
+            Location = P(252, 44),
             Size = Z(122, 26),
         };
 
@@ -169,8 +169,8 @@ internal static class PanelBuilder
             MultiSelect = false,
             SelectionMode = DataGridViewSelectionMode.FullRowSelect,
             CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal, // horizontal lines only
-            ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.Single,
-            ScrollBars = ScrollBars.Vertical,
+            ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None,
+            ScrollBars = ScrollBars.None, // newest rows only; 查看全部 covers the rest
             Font = UiTheme.Small,
             RowTemplate = { Height = S(30) },
         };
@@ -191,6 +191,13 @@ internal static class PanelBuilder
         var cDetail = new DataGridViewTextBoxColumn { Name = "详情", AutoSizeMode = DataGridViewAutoSizeColumnMode.Fill, SortMode = DataGridViewColumnSortMode.NotSortable };
         grid.Columns.AddRange(cTime, cEvent, cState, cDetail);
 
+        var headerLine = new Label
+        {
+            BackColor = UiTheme.Line,
+            Location = new Point(1, 40 + grid.ColumnHeadersHeight),
+            Size = new Size(S(390), 1),
+        };
+        logPanel.Controls.Add(headerLine);
         logPanel.Controls.Add(logTitle);
         logPanel.Controls.Add(logOpen);
         logPanel.Controls.Add(grid);
@@ -200,7 +207,7 @@ internal static class PanelBuilder
         {
             BackColor = UiTheme.Line,
             Location = P(20, 396),
-            Size = Z(392, 1),
+            Size = new Size(S(392), 1), // hairline: 1 physical px, not scaled
         };
         var version = new Label
         {
@@ -274,9 +281,9 @@ internal static class PanelBuilder
                     var evt = doc.RootElement.GetProperty("evt").GetString();
                     if (evt is "rate" or "fg-busy" or "fg-idle") continue; // per-sample noise
                     var ts = doc.RootElement.GetProperty("ts").GetString();
-                    var detail = doc.RootElement.TryGetProperty("detail", out var d) ? d.GetString() : "";
+                    var detail = doc.RootElement.TryGetProperty("detail", out var d) ? (d.GetString() ?? "") : "";
                     var map = EventMap.FirstOrDefault(m => m.Evt == evt);
-                    var label = map.Evt is null ? evt : map.Label;
+                    var label = map.Evt is null ? (evt ?? "") : map.Label;
                     var kind = map.Evt is null ? "info" : map.Kind;
                     rows.Add((ts?.Length >= 19 ? ts[11..19] : ts ?? "", label,
                         kind switch { "good" => "成功", "bad" => "警示", _ => "提示" },
@@ -286,6 +293,7 @@ internal static class PanelBuilder
 
             grid.SuspendLayout();
             grid.Rows.Clear();
+            var visible = Math.Max(1, (grid.Height - grid.ColumnHeadersHeight) / grid.RowTemplate.Height);
             if (rows.Count == 0)
             {
                 grid.Rows.Add("—", "暂无运行记录", "—", "调度事件将在此显示");
@@ -293,16 +301,18 @@ internal static class PanelBuilder
             }
             else
             {
-                foreach (var r in rows.AsEnumerable().Reverse())
+                foreach (var r in rows.AsEnumerable().Reverse().Take(visible))
                 {
                     var i = grid.Rows.Add(r.Time, r.Evt, r.State, r.Detail);
-                    var cell = grid.Rows[i].Cells[2];
-                    cell.Style.ForeColor = r.StateKind switch
+                    var row = grid.Rows[i];
+                    row.Cells[2].Style.ForeColor = r.StateKind switch
                     {
                         "good" => UiTheme.Success,
                         "bad" => UiTheme.Danger,
                         _ => UiTheme.DimText,
                     };
+                    foreach (DataGridViewCell c in row.Cells)
+                        c.ToolTipText = $"{r.Evt} · {r.Detail}";
                 }
             }
             grid.ResumeLayout();
