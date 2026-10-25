@@ -1,6 +1,10 @@
 using System.Diagnostics;
 using MvxxcbRestrain;
 
+// Per-monitor-v2 DPI awareness: without this, 150% scaling bitmap-stretches
+// the whole panel (the blur the user reported). Must run before any window.
+ApplicationConfiguration.Initialize();
+
 if (args.Length > 0 && args[0] == "--selftest")
 {
     return SelfTest.Run(args);
@@ -27,8 +31,8 @@ Form? panel = null;
 Label statusLabel = null!;
 Label headLabel = null!;
 StatusDot headDot = null!;
-ThemedButton toggleButton = null!;
-ThemedButton feedbackButton = null!;
+ReaLTaiizor.Controls.CyberButton toggleButton = null!;
+ReaLTaiizor.Controls.CyberButton feedbackButton = null!;
 ToolStripMenuItem toggleItem = null!;
 
 bool elevated = SessionMonitor.IsElevated();
@@ -258,8 +262,8 @@ void ApplyUi((string Status, string Tooltip) s)
     headDot.Color = shared.Enabled ? UiTheme.Accent : UiTheme.Danger;
     headDot.SetRunning(shared.Enabled);
     statusLabel.Text = s.Status;
-    toggleButton.Text = shared.Enabled ? "停用（OFF）" : "启用（ON）";
-    toggleButton.RefreshState(shared.Enabled);
+    toggleButton.TextButton = shared.Enabled ? "停用（OFF）" : "启用（ON）";
+    toggleButton.ColorBackground = shared.Enabled ? UiTheme.AccentDark : UiTheme.DangerDark;
     toggleItem.Text = shared.Enabled ? "停用调度" : "启用调度";
 }
 
@@ -403,119 +407,29 @@ try
 }
 catch { }
 
-panel = new Form
-{
-    Text = "mvxxcb-restrain 控制面板",
-    FormBorderStyle = FormBorderStyle.FixedDialog,
-    MaximizeBox = false,
-    MinimizeBox = false,
-    StartPosition = FormStartPosition.CenterScreen,
-    ClientSize = new System.Drawing.Size(380, 296),
-    ShowInTaskbar = false,
-    BackColor = UiTheme.Window,
-    Font = UiTheme.Ui,
-};
-panel.Shown += (_, _) => UiTheme.TryDarkTitleBar(panel.Handle);
-
-// --- status card: headline (running/stopped) + live status line ---
-var statusCard = new RoundedCard { Location = new System.Drawing.Point(20, 16), Size = new System.Drawing.Size(340, 78) };
-headDot = new StatusDot { Location = new System.Drawing.Point(18, 20) };
-headLabel = new Label{
-    Text = "调度监控运行中",
-    AutoSize = false,
-    Font = UiTheme.Head,
-    ForeColor = UiTheme.PrimaryText,
-    Location = new System.Drawing.Point(46, 12),
-    Size = new System.Drawing.Size(280, 26),
-};
-statusLabel = new Label
-{
-    Text = "当前状态：…",
-    AutoSize = false,
-    Font = UiTheme.Ui,
-    ForeColor = UiTheme.DimText,
-    Location = new System.Drawing.Point(46, 44),
-    Size = new System.Drawing.Size(278, 24),
-};
-statusCard.Controls.Add(headDot);
-statusCard.Controls.Add(headLabel);
-statusCard.Controls.Add(statusLabel);
-
-// --- elevation badge: capsule pill drawn on a flat panel ---
-var badge = new Panel
-{
-    Location = new System.Drawing.Point(20, 108),
-    Size = new System.Drawing.Size(elevated ? 118 : 268, 26),
-    BackColor = UiTheme.Window,
-};
-badge.Paint += (s, e) =>
-{
-    var r = new Rectangle(0, 0, badge.Width - 1, badge.Height - 1);
-    var (border, text) = elevated
-        ? (UiTheme.Accent, UiTheme.Accent)
-        : (UiTheme.Warn, UiTheme.Warn);
-    var fill = elevated ? UiTheme.AccentDark : Color.FromArgb(0x33, 0x25, 0x18);
-    using var path = UiTheme.Rounded(r, 13);
-    using var f = new SolidBrush(fill);
-    using var p = new Pen(border);
-    e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-    e.Graphics.FillPath(f, path);
-    e.Graphics.DrawPath(p, path);
-    TextRenderer.DrawText(e.Graphics,
-        elevated ? "●  运行权限：已提权" : "●  运行权限：普通（未提权，观测可能受限）",
-        UiTheme.Small, r with { X = 1, Y = 1 }, text,
-        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
-};
-
-// --- action buttons ---
-toggleButton = new ThemedButton
-{
-    Text = "…",
-    ButtonKind = ThemedButton.Kind.Primary,
-    Location = new System.Drawing.Point(20, 148),
-    Size = new System.Drawing.Size(210, 44),
-};
-toggleButton.Click += (_, _) => SetEnabled(!shared.Enabled);
-feedbackButton = new ThemedButton
-{
-    Text = "反馈数据",
-    ButtonKind = ThemedButton.Kind.Secondary,
-    Location = new System.Drawing.Point(240, 148),
-    Size = new System.Drawing.Size(120, 44),
-};
-feedbackButton.Click += (_, _) =>
-{
-    try
+var built = PanelBuilder.Build(elevated,
+    toggleClicked: () => SetEnabled(!shared.Enabled),
+    feedbackClicked: () =>
     {
-        var zip = FeedbackExport.Build();
-        FileLogger.Write("feedback bundle created: " + zip);
-        MessageBox.Show(panel, "已打包到桌面：\n" + zip, "反馈数据",
-            MessageBoxButtons.OK, MessageBoxIcon.Information);
-    }
-    catch (Exception ex)
-    {
-        MessageBox.Show(panel, "打包失败：" + ex.Message, "反馈数据",
-            MessageBoxButtons.OK, MessageBoxIcon.Error);
-    }
-};
-
-// --- footer ---
-var footer = new Label
-{
-    Text = $"mvxxcb-restrain v{typeof(Program).Assembly.GetName().Version?.ToString(3)} · 仅本地调度 · 明细见日志",
-    AutoSize = false,
-    Font = UiTheme.Small,
-    ForeColor = Color.FromArgb(0x59, 0x67, 0x80),
-    Location = new System.Drawing.Point(20, 262),
-    Size = new System.Drawing.Size(340, 20),
-    TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
-};
-
-panel.Controls.Add(statusCard);
-panel.Controls.Add(badge);
-panel.Controls.Add(toggleButton);
-panel.Controls.Add(feedbackButton);
-panel.Controls.Add(footer);
+        try
+        {
+            var zip = FeedbackExport.Build();
+            FileLogger.Write("feedback bundle created: " + zip);
+            MessageBox.Show(panel, "已打包到桌面：\n" + zip, "反馈数据",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(panel, "打包失败：" + ex.Message, "反馈数据",
+                MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    });
+panel = built.Form;
+statusLabel = built.StatusLabel;
+headLabel = built.HeadLabel;
+headDot = built.HeadDot;
+toggleButton = built.ToggleButton;
+feedbackButton = built.FeedbackButton;
 panel.FormClosing += (_, e) =>
 {
     // closing the window hides it; the app keeps running in the tray
