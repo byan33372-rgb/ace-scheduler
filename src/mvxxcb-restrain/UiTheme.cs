@@ -57,7 +57,7 @@ internal sealed class RoundedCard : Panel
     public RoundedCard()
     {
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-        BackColor = UiTheme.Window;
+        BackColor = UiTheme.Card; // match the painted fill so child labels blend in
     }
 
     protected override void OnPaint(PaintEventArgs e)

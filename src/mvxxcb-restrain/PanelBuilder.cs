@@ -28,6 +28,8 @@ internal static class PanelBuilder
         {
             Text = "mvxxcb-restrain 控制面板",
             FormBorderStyle = FormBorderStyle.FixedSingle,
+            Sizable = false,                  // MaterialForm draws its own chrome and
+                                              // ignores FixedSingle unless told explicitly
             FormStyle = ReaLTaiizor.Enum.Material.FormStyles.ActionBar_48,
             MaximizeBox = false,
             MinimizeBox = true,               // minimize to taskbar
