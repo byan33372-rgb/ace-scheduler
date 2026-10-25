@@ -25,7 +25,10 @@ var shared = new SharedState();
 NotifyIcon? notifyIcon = null;
 Form? panel = null;
 Label statusLabel = null!;
-Button toggleButton = null!;
+Label headLabel = null!;
+StatusDot headDot = null!;
+ThemedButton toggleButton = null!;
+ThemedButton feedbackButton = null!;
 ToolStripMenuItem toggleItem = null!;
 
 bool elevated = SessionMonitor.IsElevated();
@@ -251,8 +254,12 @@ void RunOnUi(Action action)
 void ApplyUi((string Status, string Tooltip) s)
 {
     notifyIcon!.Text = Trim63(s.Tooltip);
+    headLabel.Text = shared.Enabled ? "调度监控运行中" : "调度已停用";
+    headDot.Color = shared.Enabled ? UiTheme.Accent : UiTheme.Danger;
+    headDot.SetRunning(shared.Enabled);
     statusLabel.Text = s.Status;
     toggleButton.Text = shared.Enabled ? "停用（OFF）" : "启用（ON）";
+    toggleButton.RefreshState(shared.Enabled);
     toggleItem.Text = shared.Enabled ? "停用调度" : "启用调度";
 }
 
@@ -403,37 +410,78 @@ panel = new Form
     MaximizeBox = false,
     MinimizeBox = false,
     StartPosition = FormStartPosition.CenterScreen,
-    ClientSize = new System.Drawing.Size(360, 170),
+    ClientSize = new System.Drawing.Size(380, 296),
     ShowInTaskbar = false,
+    BackColor = UiTheme.Window,
+    Font = UiTheme.Ui,
+};
+panel.Shown += (_, _) => UiTheme.TryDarkTitleBar(panel.Handle);
+
+// --- status card: headline (running/stopped) + live status line ---
+var statusCard = new RoundedCard { Location = new System.Drawing.Point(20, 16), Size = new System.Drawing.Size(340, 78) };
+headDot = new StatusDot { Location = new System.Drawing.Point(18, 20) };
+headLabel = new Label{
+    Text = "调度监控运行中",
+    AutoSize = false,
+    Font = UiTheme.Head,
+    ForeColor = UiTheme.PrimaryText,
+    Location = new System.Drawing.Point(46, 12),
+    Size = new System.Drawing.Size(280, 26),
 };
 statusLabel = new Label
 {
     Text = "当前状态：…",
     AutoSize = false,
-    TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
-    Location = new System.Drawing.Point(16, 16),
-    Size = new System.Drawing.Size(328, 30),
+    Font = UiTheme.Ui,
+    ForeColor = UiTheme.DimText,
+    Location = new System.Drawing.Point(46, 44),
+    Size = new System.Drawing.Size(278, 24),
 };
-var elevLabel = new Label
+statusCard.Controls.Add(headDot);
+statusCard.Controls.Add(headLabel);
+statusCard.Controls.Add(statusLabel);
+
+// --- elevation badge: capsule pill drawn on a flat panel ---
+var badge = new Panel
 {
-    Text = elevated ? "运行权限：已提权" : "运行权限：普通（未提权，系统级扫描进程可能无法观测，详见日志）",
-    AutoSize = false,
-    ForeColor = elevated ? System.Drawing.Color.Green : System.Drawing.Color.DarkOrange,
-    Location = new System.Drawing.Point(16, 48),
-    Size = new System.Drawing.Size(328, 30),
+    Location = new System.Drawing.Point(20, 108),
+    Size = new System.Drawing.Size(elevated ? 118 : 268, 26),
+    BackColor = UiTheme.Window,
 };
-toggleButton = new Button
+badge.Paint += (s, e) =>
+{
+    var r = new Rectangle(0, 0, badge.Width - 1, badge.Height - 1);
+    var (border, text) = elevated
+        ? (UiTheme.Accent, UiTheme.Accent)
+        : (UiTheme.Warn, UiTheme.Warn);
+    var fill = elevated ? UiTheme.AccentDark : Color.FromArgb(0x33, 0x25, 0x18);
+    using var path = UiTheme.Rounded(r, 13);
+    using var f = new SolidBrush(fill);
+    using var p = new Pen(border);
+    e.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+    e.Graphics.FillPath(f, path);
+    e.Graphics.DrawPath(p, path);
+    TextRenderer.DrawText(e.Graphics,
+        elevated ? "●  运行权限：已提权" : "●  运行权限：普通（未提权，观测可能受限）",
+        UiTheme.Small, r with { X = 1, Y = 1 }, text,
+        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+};
+
+// --- action buttons ---
+toggleButton = new ThemedButton
 {
     Text = "…",
-    Location = new System.Drawing.Point(16, 88),
-    Size = new System.Drawing.Size(218, 45),
+    ButtonKind = ThemedButton.Kind.Primary,
+    Location = new System.Drawing.Point(20, 148),
+    Size = new System.Drawing.Size(210, 44),
 };
 toggleButton.Click += (_, _) => SetEnabled(!shared.Enabled);
-var feedbackButton = new Button
+feedbackButton = new ThemedButton
 {
     Text = "反馈数据",
-    Location = new System.Drawing.Point(242, 88),
-    Size = new System.Drawing.Size(102, 45),
+    ButtonKind = ThemedButton.Kind.Secondary,
+    Location = new System.Drawing.Point(240, 148),
+    Size = new System.Drawing.Size(120, 44),
 };
 feedbackButton.Click += (_, _) =>
 {
@@ -450,10 +498,24 @@ feedbackButton.Click += (_, _) =>
             MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
 };
-panel.Controls.Add(statusLabel);
-panel.Controls.Add(elevLabel);
+
+// --- footer ---
+var footer = new Label
+{
+    Text = $"mvxxcb-restrain v{typeof(Program).Assembly.GetName().Version?.ToString(3)} · 仅本地调度 · 明细见日志",
+    AutoSize = false,
+    Font = UiTheme.Small,
+    ForeColor = Color.FromArgb(0x59, 0x67, 0x80),
+    Location = new System.Drawing.Point(20, 262),
+    Size = new System.Drawing.Size(340, 20),
+    TextAlign = System.Drawing.ContentAlignment.MiddleLeft,
+};
+
+panel.Controls.Add(statusCard);
+panel.Controls.Add(badge);
 panel.Controls.Add(toggleButton);
 panel.Controls.Add(feedbackButton);
+panel.Controls.Add(footer);
 panel.FormClosing += (_, e) =>
 {
     // closing the window hides it; the app keeps running in the tray
@@ -465,7 +527,13 @@ panel.FormClosing += (_, e) =>
 };
 _ = panel.Handle; // force handle creation now so worker marshaling works immediately
 
-var menu = new ContextMenuStrip();
+var menu = new ContextMenuStrip
+{
+    BackColor = UiTheme.Card,
+    ForeColor = UiTheme.PrimaryText,
+    ShowImageMargin = false,
+    Font = UiTheme.Ui,
+};
 menu.Items.Add("打开控制面板", null, (_, _) => { panel.Show(); panel.Activate(); });
 toggleItem = new ToolStripMenuItem("…");
 toggleItem.Click += (_, _) => SetEnabled(!shared.Enabled);
