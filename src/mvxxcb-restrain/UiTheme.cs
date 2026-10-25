@@ -6,24 +6,26 @@ namespace MvxxcbRestrain;
 /// drawing helpers, DWM dark title bar, and the themed controls used by Program.cs.</summary>
 internal static class UiTheme
 {
-    // palette: deep blue-black base, neon mint accent (matches the gaming-tool look)
-    public static readonly Color Window = Color.FromArgb(0x0E, 0x15, 0x23);
-    public static readonly Color Card = Color.FromArgb(0x1A, 0x23, 0x32);
-    public static readonly Color CardBorder = Color.FromArgb(0x2A, 0x38, 0x50);
-    public static readonly Color PrimaryText = Color.FromArgb(0xE8, 0xEE, 0xF7);
-    public static readonly Color DimText = Color.FromArgb(0x8B, 0x9B, 0xB5);
-    public static readonly Color Accent = Color.FromArgb(0x00, 0xE5, 0xA0);      // running / enabled
-    public static readonly Color AccentDark = Color.FromArgb(0x0D, 0x2B, 0x26);  // accent-tinted button fill
-    public static readonly Color Warn = Color.FromArgb(0xFF, 0x9F, 0x43);        // not elevated
-    public static readonly Color Danger = Color.FromArgb(0xFF, 0x6B, 0x6B);      // disabled state
-    public static readonly Color DangerDark = Color.FromArgb(0x33, 0x15, 0x20);
-    public static readonly Color Button2 = Color.FromArgb(0x23, 0x2E, 0x42);     // secondary button
-    public static readonly Color Button2Hover = Color.FromArgb(0x2E, 0x3B, 0x52);
+    // palette: unified dark tokens from the UI review report (slate base + cyan primary action)
+    public static readonly Color Window = Color.FromArgb(0x11, 0x18, 0x27);      // main background
+    public static readonly Color Card = Color.FromArgb(0x1F, 0x29, 0x37);        // content surface
+    public static readonly Color CardBorder = Color.FromArgb(0x37, 0x41, 0x51);  // dividers / weak stroke
+    public static readonly Color PrimaryText = Color.FromArgb(0xF3, 0xF4, 0xF6);
+    public static readonly Color DimText = Color.FromArgb(0x9C, 0xA3, 0xAF);
+    public static readonly Color Accent = Color.FromArgb(0x08, 0x91, 0xB2);      // primary interactions only
+    public static readonly Color AccentDark = Color.FromArgb(0x0B, 0x5E, 0x73);  // dark companion fill for accent (button base/hover)
+    public static readonly Color Success = Color.FromArgb(0x34, 0xD3, 0x99);     // 成功/授权——只表达真实成功状态
+    public static readonly Color Warn = Color.FromArgb(0xFF, 0x9F, 0x43);        // not elevated (out of report scope)
+    public static readonly Color Danger = Color.FromArgb(0xFB, 0x71, 0x85);      // disabled state
+    public static readonly Color DangerDark = Color.FromArgb(0x4A, 0x1F, 0x2B);
+    public static readonly Color Button2 = Color.FromArgb(0x1F, 0x29, 0x37);     // secondary button surface
+    public static readonly Color Button2Hover = Color.FromArgb(0x26, 0x32, 0x43);
 
-    public static readonly Font Ui = new("Microsoft YaHei UI", 9F);
-    public static readonly Font UiBold = new("Microsoft YaHei UI", 9F, FontStyle.Bold);
-    public static readonly Font Head = new("Microsoft YaHei UI", 12.5F, FontStyle.Bold);
-    public static readonly Font Small = new("Microsoft YaHei UI", 8.25F);
+    // type ladder from the review report: Head ~18.7px, Ui/UiBold 14px, Small 12px
+    public static readonly Font Ui = new("Microsoft YaHei UI", 10.5F);
+    public static readonly Font UiBold = new("Microsoft YaHei UI", 10.5F, FontStyle.Bold);
+    public static readonly Font Head = new("Microsoft YaHei UI", 14F, FontStyle.Bold);
+    public static readonly Font Small = new("Microsoft YaHei UI", 9F);
 
     public static System.Drawing.Drawing2D.GraphicsPath Rounded(Rectangle r, int rad)
     {

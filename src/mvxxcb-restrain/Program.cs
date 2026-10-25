@@ -230,15 +230,15 @@ void RetargetIfNeeded(DateTimeOffset now)
         err = targets.Values.FirstOrDefault(t => t.Engine.LastError is not null)?.Engine.LastError;
     }
     var elevTag = elevated ? "" : " | 未提权";
-    if (!shared.Enabled) return ("当前状态：已停用（不干预任何进程）", "mvxxcb-restrain | 已停用" + elevTag);
-    if (count == 0) return ("当前状态：运行中，未发现扫描进程", "mvxxcb-restrain | 运行中，未发现扫描进程" + elevTag);
+    if (!shared.Enabled) return ("已停用：不观测、不限制任何进程", "mvxxcb-restrain | 已停用" + elevTag);
+    if (count == 0) return ("未发现扫描进程，磁盘空闲", "mvxxcb-restrain | 未发现扫描进程，磁盘空闲" + elevTag);
     if (err is not null)
     {
-        var s = $"当前状态：限速失败（{err}）";
-        return (s, Trim63("mvxxcb-restrain | " + s[5..] + elevTag));
+        var s = $"限速失败（{err}）";
+        return (s, Trim63("mvxxcb-restrain | " + s + elevTag));
     }
-    var t = $"当前状态：调度中，目标进程 {count} 个";
-    return (t, Trim63("mvxxcb-restrain | " + t[5..] + elevTag));
+    var t = $"调度中，目标进程 {count} 个";
+    return (t, Trim63("mvxxcb-restrain | " + t + elevTag));
 }
 
 static string Trim63(string s) => s.Length > 63 ? s[..63] : s;
@@ -258,12 +258,13 @@ void RunOnUi(Action action)
 void ApplyUi((string Status, string Tooltip) s)
 {
     notifyIcon!.Text = Trim63(s.Tooltip);
-    headLabel.Text = shared.Enabled ? "调度监控运行中" : "调度已停用";
-    headDot.Color = shared.Enabled ? UiTheme.Accent : UiTheme.Danger;
+    headLabel.Text = shared.Enabled ? "调度运行中" : "调度未运行";
+    headDot.Color = shared.Enabled ? UiTheme.Success : UiTheme.Danger;
     headDot.SetRunning(shared.Enabled);
     statusLabel.Text = s.Status;
-    toggleButton.TextButton = shared.Enabled ? "停用（OFF）" : "启用（ON）";
-    toggleButton.ColorBackground = shared.Enabled ? UiTheme.AccentDark : UiTheme.DangerDark;
+    toggleButton.TextButton = shared.Enabled ? "停用调度" : "启用调度";
+    toggleButton.ColorBackground = shared.Enabled ? UiTheme.Danger : UiTheme.Accent;
+    toggleButton.ColorBackground_Pen = shared.Enabled ? UiTheme.Danger : UiTheme.Accent;
     toggleItem.Text = shared.Enabled ? "停用调度" : "启用调度";
 }
 
