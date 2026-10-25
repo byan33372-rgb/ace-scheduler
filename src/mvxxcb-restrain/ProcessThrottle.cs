@@ -101,8 +101,13 @@ public static class ProcessThrottle
             {
                 return (RecoverOutcome.KeptForRetry, $"OpenProcess access denied (err 5) - snapshot kept journaled for the next startup");
             }
-            Forget(processId); // really gone (err 87 etc.)
-            return (RecoverOutcome.Gone, null);
+            if (err == ErrorInvalidParameter)
+            {
+                Forget(processId); // pid confirmed gone
+                return (RecoverOutcome.Gone, null);
+            }
+            // transient/unknown error: keep the record, do not gamble it away
+            return (RecoverOutcome.KeptForRetry, $"OpenProcess err {err} - snapshot kept journaled for the next startup");
         }
         try
         {
@@ -157,20 +162,37 @@ public static class ProcessThrottle
             var handle = OpenProcess(RightsNeeded, false, e.pid);
             if (handle == IntPtr.Zero)
             {
-                if (Marshal.GetLastWin32Error() == ErrorAccessDenied)
+                var openErr = Marshal.GetLastWin32Error();
+                if (openErr == ErrorAccessDenied)
                 {
                     FileLogger.Write($"journal recovery: pid={e.pid} access denied (run elevated?) - entry KEPT for the next start");
                     continue; // keep
                 }
-                remaining.Remove(e); // confirmed gone
+                remaining.Remove(e); // confirmed gone (err 87 etc.)
                 continue;
             }
             try
             {
-                if (!GetCreationFiletime(handle, out var created) || (e.createdAt.HasValue && created != e.createdAt))
+                if (!GetCreationFiletime(handle, out var created))
                 {
-                    remaining.Remove(e); // pid reused or identity unreadable: never write
+                    // identity unreadable on a LIVE process: never write, but
+                    // never lose the record either - keep and retry later
+                    FileLogger.Write($"journal recovery: pid={e.pid} creation time unreadable - entry KEPT for the next start");
+                    continue;
+                }
+                if (e.createdAt.HasValue && created != e.createdAt)
+                {
+                    remaining.Remove(e); // pid reused: never write
                     FileLogger.Write($"journal recovery: pid={e.pid} identity mismatch (reused pid) - entry dropped");
+                    continue;
+                }
+                // the journal's name field is attacker-controlled text; only
+                // the LIVE process's real image name decides (review P0-A)
+                var realName = GetImageBaseName(handle);
+                if (realName is null || !TargetDiscovery.ScannerProcessNames.Contains(realName, StringComparer.OrdinalIgnoreCase))
+                {
+                    remaining.Remove(e); // forged or no longer a scanner: refuse to touch it
+                    FileLogger.Write($"journal recovery: pid={e.pid} real image '{realName ?? "?"}' not in scanner allowlist - entry dropped, process untouched");
                     continue;
                 }
                 var snap = new ThrottleSnapshot(e.priorityClass, (IntPtr)e.affinity, e.ioPriority, e.createdAt, e.name);
@@ -191,7 +213,20 @@ public static class ProcessThrottle
             }
         }
 
-        lock (Gate) WriteJournalEntriesLocked(remaining);
+        // kept entries are re-registered as snapshots: they survive every
+        // later journal write (which serializes Snapshots), and if the same
+        // pid is re-adopted with a matching creation time, Throttle reuses
+        // the ORIGINAL values instead of snapshotting the polluted state
+        // (review P0-C)
+        lock (Gate)
+        {
+            Snapshots.Clear();
+            foreach (var e in remaining)
+            {
+                Snapshots[e.pid] = new ThrottleSnapshot(e.priorityClass, (IntPtr)e.affinity, e.ioPriority, e.createdAt, e.name);
+            }
+            WriteJournalLocked();
+        }
         return (remaining.Count, restored, droppedInvalid);
     }
 
@@ -224,20 +259,27 @@ public static class ProcessThrottle
                 }
                 snap = new ThrottleSnapshot(prio, affinity, QueryIoPriority(handle), createdAt, name);
                 Snapshots[pid] = snap;
-                WriteJournalLocked();
+                // fail-closed INCLUDING this first write: a throttle without
+                // a persisted recovery record must never be applied
+                if (!WriteJournalLocked())
+                {
+                    Snapshots.Remove(pid);
+                    return "journal write failed - refusing to throttle (no recovery record would exist)";
+                }
             }
             else
             {
                 // pid reuse guard: the live process must still be the one we
-                // snapshotted, otherwise the old originals would be written
-                // onto an innocent process at release time
+                // snapshotted. The snapshot is KEPT (not discarded) so every
+                // retry keeps refusing until the worker's identity probe
+                // retires the target - discarding it here would let the
+                // engine's retry create a fresh snapshot for the new process
+                // and throttle it (review P0-D).
                 if (existing.CreatedAtFiletime.HasValue
                     && (!GetCreationFiletime(handle, out var nowCreated) || nowCreated != existing.CreatedAtFiletime.Value))
                 {
-                    FileLogger.Write($"pid={pid} creation time mismatch (pid reused) - discarding stale snapshot");
-                    Snapshots.Remove(pid);
-                    WriteJournalLocked();
-                    return "pid was reused; stale snapshot discarded - retrying adoption on the next sample";
+                    FileLogger.Write($"pid={pid} creation time mismatch (pid reused) - refusing to throttle; snapshot kept until re-adoption retires this target");
+                    return "pid was reused; refusing to throttle this pid until it is re-adopted";
                 }
                 snap = existing;
             }
@@ -368,21 +410,35 @@ public static class ProcessThrottle
         return false;
     }
 
+    /// <summary>Base name (no extension) of the LIVE process image; null when unreadable.</summary>
+    private static string? GetImageBaseName(IntPtr handle)
+    {
+        var buf = new char[512];
+        var len = buf.Length;
+        if (!QueryFullProcessImageName(handle, 0, buf, ref len)) return null;
+        return Path.GetFileNameWithoutExtension(new string(buf, 0, len));
+    }
+
     // ---------------- journal ----------------
 
-    private static void WriteJournalLocked()
-        => WriteJournalEntriesLocked(Snapshots.Select(kv =>
-            new JournalEntry(kv.Key, kv.Value.Name, kv.Value.CreatedAtFiletime, kv.Value.PriorityClass, kv.Value.Affinity.ToInt64(), kv.Value.IoPriority)).ToList());
-
-    private static void WriteJournalEntriesLocked(List<JournalEntry> entries)
+    /// <summary>Serialize the snapshot table. Returns false when the write failed (fail-closed callers must not throttle then).</summary>
+    private static bool WriteJournalLocked()
     {
-        if (_journalPath is null) return;
+        var entries = Snapshots.Select(kv =>
+            new JournalEntry(kv.Key, kv.Value.Name, kv.Value.CreatedAtFiletime, kv.Value.PriorityClass, kv.Value.Affinity.ToInt64(), kv.Value.IoPriority)).ToList();
+        return WriteJournalEntriesLocked(entries);
+    }
+
+    private static bool WriteJournalEntriesLocked(List<JournalEntry> entries)
+    {
+        if (_journalPath is null) return true; // no journal configured (selftest)
         try
         {
             var tmp = _journalPath + ".tmp";
             File.WriteAllText(tmp, JsonSerializer.Serialize(new JournalFile(entries)));
             File.Move(tmp, _journalPath, overwrite: true);
             _journalHealthy = true;
+            return true;
         }
         catch
         {
@@ -392,13 +448,15 @@ public static class ProcessThrottle
                 _journalFailureLogged = true;
                 FileLogger.Write("journal write failed - further throttles will be refused until the journal is writable (fail-closed)");
             }
+            return false;
         }
     }
 
     /// <summary>
     /// Read and validate the journal. Entries failing validation are dropped
     /// and counted: the journal lives in a user-writable directory, so it is
-    /// untrusted input (review P0-A).
+    /// untrusted input (review P0-A). Oversized/too-many/corrupt files are
+    /// quarantined (.corrupt-&lt;stamp&gt;) instead of being silently ignored.
     /// </summary>
     private static (List<JournalEntry> entries, int dropped) ReadJournalValidated()
     {
@@ -408,17 +466,31 @@ public static class ProcessThrottle
             var fi = new FileInfo(_journalPath);
             if (fi.Length > 64 * 1024)
             {
-                FileLogger.Write($"journal oversized ({fi.Length}B) - treated as corrupt, ignored");
+                Quarantine($"oversized ({fi.Length}B)");
                 return (new List<JournalEntry>(), 0);
             }
-            var file = JsonSerializer.Deserialize<JournalFile>(File.ReadAllText(_journalPath));
+            JournalFile? file;
+            try
+            {
+                file = JsonSerializer.Deserialize<JournalFile>(File.ReadAllText(_journalPath));
+            }
+            catch (Exception ex)
+            {
+                Quarantine($"unparseable ({ex.Message})");
+                return (new List<JournalEntry>(), 0);
+            }
             var raw = file?.entries ?? new List<JournalEntry>();
             if (raw.Count > 64)
             {
-                FileLogger.Write($"journal has too many entries ({raw.Count}) - treated as corrupt, ignored");
+                Quarantine($"too many entries ({raw.Count})");
                 return (new List<JournalEntry>(), raw.Count);
             }
-            GetProcessAffinityMask(GetCurrentProcess(), out _, out var systemMask);
+            // affinity bounds: fall back to a permissive mask when the query
+            // fails - a failed check must not mass-reject valid entries
+            if (!GetProcessAffinityMask(GetCurrentProcess(), out _, out var systemMask))
+            {
+                systemMask = FullAffinityMask();
+            }
             var valid = new List<JournalEntry>();
             var dropped = 0;
             foreach (var e in raw)
@@ -439,10 +511,20 @@ public static class ProcessThrottle
             }
             if (dropped > 0) FileLogger.Write($"journal validation: kept {valid.Count}, dropped {dropped} invalid entr{(dropped == 1 ? "y" : "ies")}");
             return (valid, dropped);
+
+            void Quarantine(string why)
+            {
+                FileLogger.Write($"journal {why} - quarantined as .corrupt-<stamp>, starting empty");
+                try
+                {
+                    File.Move(_journalPath!, _journalPath + ".corrupt-" + DateTime.Now.ToString("yyyyMMdd-HHmmss"));
+                }
+                catch { /* best effort */ }
+            }
         }
         catch (Exception ex)
         {
-            FileLogger.Write($"journal unreadable ({ex.Message}) - treated as empty; original left on disk");
+            FileLogger.Write($"journal read error ({ex.Message}) - treated as empty; original left on disk");
             return (new List<JournalEntry>(), 0);
         }
     }
@@ -494,6 +576,9 @@ public static class ProcessThrottle
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetProcessAffinityMask(IntPtr hProcess, out IntPtr processAffinityMask, out IntPtr systemAffinityMask);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool QueryFullProcessImageName(IntPtr hProcess, int flags, char[] exeName, ref int size);
 
     [DllImport("ntdll.dll")]
     private static extern int NtSetInformationProcess(IntPtr hProcess, int infoClass, ref int info, int length);

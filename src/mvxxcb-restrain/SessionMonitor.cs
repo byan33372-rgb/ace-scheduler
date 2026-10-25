@@ -307,6 +307,7 @@ public sealed class SessionMonitor
             _lastScanSeen = null; _gameExitAt = null; _gameStartAt = null;
             _fgLastTick = null; _fgBusySeconds = 0; _fgTotalSeconds = 0; _finished.Clear();
             _gamesPresent.Clear(); // a fresh session must re-observe game-start
+            _fgFullscreen = false; // ...and must re-observe fg-busy
         }
     }
 
@@ -322,6 +323,7 @@ public sealed class SessionMonitor
             _lastScanSeen = null; _gameExitAt = null; _gameStartAt = null;
             _fgLastTick = null; _fgBusySeconds = 0; _fgTotalSeconds = 0; _finished.Clear();
             _gamesPresent.Clear(); // a fresh session must re-observe game-start
+            _fgFullscreen = false; // ...and must re-observe fg-busy
         }
     }
 

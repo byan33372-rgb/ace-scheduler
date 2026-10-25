@@ -336,6 +336,23 @@ void WorkerLoop()
                         }
                         entry.NullStreak = 0;
                         entry.EverSampled = true;
+                        // periodic identity probe (every ~2s): a reused pid with
+                        // readable IO never trips NullStreak, so the identity
+                        // must be checked on the happy path too (review P0-D)
+                        if (entry.CreatedAtFiletime.HasValue && ++entry.IdentityTick >= 4)
+                        {
+                            entry.IdentityTick = 0;
+                            try
+                            {
+                                using var p = Process.GetProcessById(entry.Pid);
+                                if (p.StartTime.ToFileTime() != entry.CreatedAtFiletime.Value)
+                                {
+                                    FileLogger.Write($"pid={entry.Pid} identity changed (pid reused) - retiring target");
+                                    entry.NullStreak = NullStreakLimit; // next RetargetIfNeeded run takes the dead path
+                                }
+                            }
+                            catch { /* unreadable now: retry on the next probe */ }
+                        }
                         var result = entry.Engine.OnSample(bytes.Value, now, fg);
                         monitor.EngineSample(entry.Pid, result.RateMBps, result.State.ToString(), now, dt);
                     }
@@ -529,4 +546,5 @@ sealed class TargetEntry
     public bool EverSampled; // false at death = observation-denied -> long re-adoption backoff
     public DateTimeOffset LastObserveLostLog = DateTimeOffset.MinValue; // rate-limits sampler-outage logs
     public long? CreatedAtFiletime; // pid-reuse guard: the adopted process's identity
+    public int IdentityTick; // periodic identity probe cadence (~4 samples = 2s)
 }
