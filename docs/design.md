@@ -4,7 +4,6 @@
 
 ACE（AntiCheatExpert）的扫盘由 SGuard 子系统实现：`SGuard64.exe`（LocalSystem 服务，游戏退出后仍运行）+ 游戏内 `ACE-Service64.exe` + 5 个内核驱动。扫描路线是经典的全盘枚举：`GetLogicalDriveStrings → GetDriveType → FindFirstFileEx 递归 → ReadFile/MapViewOfFile → MD5/SHA1 哈希 → SQLite 比对（加密规则库）→ curl 上报`。
 
-详细二进制证据见 [ace-scan-analysis.md](ace-scan-analysis.md)。
 
 社区既有工具（ace-helper、FuckACE）的共性短板：
 
