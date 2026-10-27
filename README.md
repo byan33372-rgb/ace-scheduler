@@ -103,6 +103,19 @@ IO 优先级是存储栈调度提示而非硬约束；对 SYSTEM 级或带受限
 ./register-task.ps1         # -Uninstall 移除
 ```
 
+## 发布命名规范
+
+发布物一律以软件名开头，版本号随后，不使用描述性标题：
+
+| 对象 | 格式 | 示例 |
+|---|---|---|
+| Release 标题 | `mvxxcb-restrain vX.Y.Z` | `mvxxcb-restrain v0.4.2` |
+| 可执行文件 | `mvxxcb-restrain.exe` | — |
+| 便携包 | `mvxxcb-restrain-X.Y.Z-portable.zip` | `mvxxcb-restrain-0.4.2-portable.zip` |
+| 标签 | `vX.Y.Z` | `v0.4.2` |
+
+发布前确认：标签指向的提交 = main 最新提交 = 产物构建所用源码，三者一致。
+
 ## 许可与免责
 
 MIT License。本工具仅调用公开操作系统接口调整资源分配，不修改、不干扰任何第三方软件的功能与检测行为；与任何游戏厂商及安全厂商无关。调整第三方进程优先级存在理论与账号风险，使用后果由使用者自行承担，仅供学习研究。
