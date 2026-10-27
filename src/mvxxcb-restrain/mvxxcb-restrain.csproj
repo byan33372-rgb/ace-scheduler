@@ -8,7 +8,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>mvxxcb-restrain</AssemblyName>
     <RootNamespace>MvxxcbRestrain</RootNamespace>
-    <Version>0.4.1</Version>
+    <Version>0.4.2</Version>
     <ApplicationIcon>..\..\assets\app.ico</ApplicationIcon>
     <Description>External resource scheduler for background file scanners. Resource scheduling only; no injection, no blocking.</Description>
   </PropertyGroup>
